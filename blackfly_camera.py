@@ -153,6 +153,22 @@ class BlackflyCamera(Camera):
             continuous = acq_mode.GetEntryByName("Continuous")
             acq_mode.SetIntValue(continuous.GetValue())
 
+        # Force "newest frame only" buffering on the transport-layer stream,
+        # matching BaslerCamera's GrabStrategy_LatestImageOnly. Without this,
+        # Spinnaker's default buffer handling can leave stale, already-
+        # acquired frames queued ahead of GetNextImage() -- so calling
+        # capture() right after set_exposure_time() could silently return an
+        # old frame from before the exposure change, making it look like
+        # changing exposure did nothing even though it worked correctly on
+        # the camera itself. Must be set before BeginAcquisition().
+        tl_stream_nodemap = self._cam.GetTLStreamNodeMap()
+        handling_mode = PySpin.CEnumerationPtr(
+            tl_stream_nodemap.GetNode("StreamBufferHandlingMode")
+        )
+        if PySpin.IsWritable(handling_mode):
+            newest_only = handling_mode.GetEntryByName("NewestOnly")
+            handling_mode.SetIntValue(newest_only.GetValue())
+
         # Lab policy (2026-09 meeting): raw sensor data, no on-camera
         # color/tone processing.
         if PySpin.IsAvailable(self._cam.GammaEnable) and PySpin.IsWritable(self._cam.GammaEnable):

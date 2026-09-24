@@ -11,12 +11,20 @@ test_on_hardware_slm.py so all three test scripts stay in sync (same
 camera-picking prompt, same built-in test patterns).
 
 Run:
-    python3 test_on_hardware_camera_slm.py [masks_folder]
+    python3 test_on_hardware_camera_slm.py [--mirrored] [masks_folder]
+
+The display window is borderless (no title bar) via Tkinter -- see
+slm_display.py's module docstring ("Why Tkinter") for why this replaced
+an earlier OpenCV-window-based implementation that couldn't reliably
+get rid of its title bar on macOS.
 
 If masks_folder is given, loads real masks from it (see
 load_masks_from_folder()'s docstring for naming/sizing rules). If
 omitted, falls back to the same generated test patterns as
 test_on_hardware_slm.py (currently checkerboard/white/black/stripes).
+
+Pass --mirrored if the SLM is set to mirror your laptop screen rather
+than extend the desktop (see slm_display.py's SLMDisplay docstring).
 
 Commands at the prompt:
     m <index>     show one mask on the SLM immediately
@@ -48,10 +56,17 @@ OUTPUT_DIR = Path("test_captures")
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    if len(sys.argv) > 1:
-        print(f"Loading masks from {sys.argv[1]}...")
+    args = sys.argv[1:]
+    mirrored = "--mirrored" in args
+    args = [a for a in args if a != "--mirrored"]
+
+    if mirrored:
+        print("--mirrored passed -- targeting the primary monitor (SLM assumed to be mirroring it).")
+
+    if len(args) > 0:
+        print(f"Loading masks from {args[0]}...")
         try:
-            masks = load_masks_from_folder(sys.argv[1])
+            masks = load_masks_from_folder(args[0])
         except SLMError as e:
             print(f"Could not load masks: {e}")
             sys.exit(1)
@@ -71,7 +86,7 @@ def main():
         sys.exit(1)
 
     try:
-        slm = SLMDisplay(masks)
+        slm = SLMDisplay(masks, mirrored=mirrored)
         slm.open()
     except SLMError as e:
         print(f"Failed to open SLM display: {e}")
@@ -109,7 +124,6 @@ def main():
                     print(f"Saved {saved} -- open it to check exposure/focus/framing.")
                     if label == "basler":
                         preview = saved.with_name(saved.stem + "_preview.png")
-                        print(f"  (also saved a normal-looking preview: {preview})")
                     shot += 1
                 except CameraError as e:
                     print(f"Capture failed: {e}")

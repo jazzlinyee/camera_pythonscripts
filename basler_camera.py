@@ -14,15 +14,26 @@ Setup (one-time, on the machine the camera is physically connected to):
         # or
         pip install pillow
 
-Capture policy (set after the 2026-09 meeting):
+Capture policy (set after the 2026-09 meeting, revised 2026-09-22):
     Frames are captured at the sensor's true 12-bit depth instead of the
     previous 8-bit default. The camera's PixelFormat is set to "Mono12"
     and the pylon ImageFormatConverter outputs Mono16 (a 16-bit container
-    holding the real 0-4095 range), LSB-aligned so the saved pixel values
-    are the literal 12-bit sensor counts rather than left-shifted to fill
-    16 bits. Frames are written out as .tiff (a format that preserves
-    16-bit single-channel data losslessly -- .png would also work, but
-    .tiff is what's expected here).
+    holding the real 0-4095 range). Frames are written out as .tiff (a
+    format that preserves 16-bit single-channel data losslessly -- .png
+    would also work, but .tiff is what's expected here).
+
+    MSB-aligned, not LSB-aligned (changed 2026-09-22): each 12-bit sensor
+    value is shifted up to occupy the top of the 16-bit range (value*16),
+    e.g. a real reading of 188 is stored as 3008. This is a lossless,
+    exactly-reversible bit shift -- no measurement precision is lost --
+    chosen specifically so the saved .tiff displays at roughly correct
+    brightness in an ordinary viewer (Preview, etc.) without any extra
+    stretching step, since LSB-aligned values only filled a tiny sliver
+    of the 16-bit range and looked solid black by eye despite being
+    correct data. Any code reading these files for real analysis must
+    divide by 16 (or bit-shift right by 4) to recover the true 0-4095
+    sensor value -- otherwise brightness readings will be 16x too high
+    versus what was actually measured.
 
 Usage:
     from basler_camera import BaslerCamera
@@ -116,11 +127,22 @@ class BaslerCamera(Camera):
 
         # Frames come off the sensor as Mono12 (see _configure()); this
         # converter hands them back as Mono16 so numpy/TIFF tooling can
-        # work with them directly, keeping the true 0-4095 pixel values
-        # (LsbAligned) rather than left-shifting into the full 16-bit range.
+        # work with them directly.
+        #
+        # MSB-aligned (not LSB-aligned): each 12-bit value (0-4095) is
+        # shifted up to occupy the top of the 16-bit range, e.g. 188
+        # becomes 188*16=3008. This is a lossless, exactly-reversible bit
+        # shift -- no measurement precision is lost -- but it means the
+        # saved .tiff fills close to the full 0-65535 range instead of a
+        # tiny sliver of it, so it displays at roughly normal brightness
+        # in an ordinary viewer (Preview, etc.) without any extra
+        # stretching step. The tradeoff: any code that reads these files
+        # for real analysis must divide by 16 (or bit-shift right by 4)
+        # to recover the true 0-4095 sensor value -- otherwise brightness
+        # values will read 16x too high versus what was actually measured.
         self._converter = pylon.ImageFormatConverter()
         self._converter.OutputPixelFormat = pylon.PixelType_Mono16
-        self._converter.OutputBitAlignment = pylon.OutputBitAlignment_LsbAligned
+        self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
 
         self._is_open = True
 
@@ -194,7 +216,7 @@ class BaslerCamera(Camera):
             raise CameraError("Camera is not open. Call open() first.")
         return self._cam.ExposureTime.GetValue()
 
-    def capture(self, save_path: Union[str, Path], save_preview: bool = True) -> Path:
+    def capture(self, save_path: Union[str, Path], save_preview: bool = False) -> Path:
         """Grab the next available frame and save it to save_path.
 
         Waits up to 5 seconds for a frame. The raw frame is converted to
@@ -204,16 +226,18 @@ class BaslerCamera(Camera):
         Args:
             save_path: Where to save the raw 12-bit .tiff (or whatever
                 format/extension you pass).
-            save_preview: If True (default), also saves a brightness-
-                stretched 8-bit .png next to save_path (same name with
-                "_preview" appended before the extension). Ordinary image
-                viewers display 16-bit files against the full 0-65535
-                range, so the true 12-bit data (0-4095) can look solid
-                black even when well-exposed; this preview exists purely
-                so the capture can be checked by eye without extra tools.
-                It is for looking at only -- always do real analysis on
-                the raw file, since the preview's values are rescaled and
-                no longer the true measured intensity.
+            save_preview: If True, also saves a brightness-normalized
+                8-bit .png next to save_path (same name with "_preview"
+                appended before the extension). Defaults to False as of
+                2026-09-22 -- since the raw .tiff is now saved MSB-aligned
+                (see module docstring), it already displays at roughly
+                correct brightness in an ordinary viewer on its own, so
+                this is no longer needed for routine viewing. Left in for
+                edge cases (e.g. a viewer that still shows it oddly, or
+                wanting an 8-bit copy for something else) -- it is for
+                looking at only, never for real analysis, since its
+                values are independently rescaled and not the true
+                measured intensity.
 
         Raises:
             CameraError: if start() hasn't been called yet, or the grab fails.
@@ -250,19 +274,19 @@ class BaslerCamera(Camera):
 
     @staticmethod
     def _save_preview(img_array, save_path: Path) -> None:
-        """Save a brightness-stretched 8-bit .png preview next to save_path.
+        """Save a brightness-normalized 8-bit .png preview next to save_path.
 
-        The raw file holds true 12-bit values (0-4095) inside a 16-bit
-        container -- correct for analysis, but it can look solid black in
-        ordinary viewers since they display 16-bit data against the full
-        0-65535 range. This preview rescales 0-4095 to 0-255 purely so the
-        capture can be checked by eye; it changes nothing about the raw
+        Not used by default as of 2026-09-22 -- the raw .tiff is now saved
+        MSB-aligned (see module docstring) and already looks roughly
+        correct in an ordinary viewer on its own. This rescales the full
+        0-65535 MSB-aligned range down to 0-255 for whoever still wants an
+        8-bit copy for some other reason; it changes nothing about the raw
         file and isn't used for anything downstream.
         """
         import numpy as np
 
         preview_path = save_path.with_name(save_path.stem + "_preview.png")
-        stretched = np.clip(img_array, 0, 4095).astype(np.float32) / 4095.0 * 255
+        stretched = np.clip(img_array, 0, 65535).astype(np.float32) / 65535.0 * 255
         stretched = stretched.astype(np.uint8)
 
         try:

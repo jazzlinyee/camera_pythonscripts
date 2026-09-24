@@ -75,9 +75,6 @@ def main():
                 try:
                     saved = cam.capture(path)
                     print(f"Saved {saved} -- open it to check exposure/focus/framing.")
-                    if label == "basler":
-                        preview = saved.with_name(saved.stem + "_preview.png")
-                        print(f"  (also saved a normal-looking preview: {preview})")
                     shot += 1
                 except CameraError as e:
                     print(f"Capture failed: {e}")

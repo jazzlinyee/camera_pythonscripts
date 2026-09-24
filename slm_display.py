@@ -3,33 +3,64 @@ Display control for the HOLOEYE amplitude SLM (HES 7020-1 6001).
 
 Unlike the two cameras in this project, this SLM has no vendor SDK / frame-
 grab API to call into (see project notes). It's addressed purely as a
-second monitor over HDMI: whatever image is shown in a fullscreen window
+second monitor over HDMI: whatever image is shown in a borderless window
 on that display *is* the mask pattern. This module treats it exactly that
-way -- open a fullscreen window on the SLM's monitor, then control which
-mask image is showing and for how long.
+way -- open a borderless window that exactly covers the SLM's monitor,
+then control which mask image is showing and for how long.
 
 Setup:
-    pip install opencv-python      # NOT opencv-python-headless -- see note below
-    pip install screeninfo         # for finding the SLM's monitor geometry
+    pip install opencv-python-headless   # only used to LOAD mask images
+    pip install screeninfo                # for finding the SLM's monitor geometry
+    tkinter (standard library, but some conda/pyenv Python builds omit the
+        Tk bindings -- check with `python3 -c "import tkinter"`; if that
+        fails, try `conda install -c conda-forge tk`, or rebuild the env
+        with a conda-forge Python, which normally bundles Tk support)
 
-    IMPORTANT -- opencv-python vs opencv-python-headless:
-    blackfly_camera.py / basler_camera.py only ever *save* image files, so
-    they work fine with opencv-python-headless (no GUI backend). This
-    module needs to *display* images in a real window, which headless
-    builds cannot do at all (cv2.namedWindow/imshow raise "function not
-    implemented" errors). opencv-python and opencv-python-headless both
-    install as the `cv2` module and having both installed at once causes
-    conflicts, so if this environment currently has opencv-python-headless
-    installed for the cameras:
-        pip uninstall opencv-python-headless
-        pip install opencv-python
-    (The camera scripts' save functions work identically with either
-    package -- only this module actually needs the GUI-enabled one.)
+    IMPORTANT -- this module used to require the full (non-headless)
+    opencv-python package, because it displayed images via cv2's own GUI
+    window. It now displays via Tkinter instead (see "Why Tkinter"
+    below), so cv2 is only used by load_masks_from_folder() to read mask
+    files off disk -- opencv-python-headless is enough. If you still have
+    the full opencv-python installed from before, there's no need to
+    remove it; either package works for the loading path.
 
     Physically: plug the SLM's driver unit into an HDMI output as an
     EXTENDED desktop display, not a mirrored one, and power it on. Confirm
     your OS's display settings show it as a separate ~1920x1080 monitor
-    before running anything here.
+    before running anything here. (mirrored=True exists as a fallback for
+    when extending genuinely isn't available -- see its docstring below --
+    but extending is the normal, recommended setup.)
+
+Why Tkinter, not cv2's own window (changed 2026-09-22):
+    This module originally displayed masks in an OpenCV highgui window.
+    Getting that window to actually cover the SLM's monitor edge-to-edge
+    on macOS turned out to be persistently unreliable:
+      - cv2.moveWindow()/resizeWindow() position the window's outer
+        FRAME (title bar included), not its content area. However
+        precisely the monitor's bounds were requested, a title-bar-sized
+        strip of chrome always ate into the top of the display, and an
+        equal-sized strip of mask content was pushed off the bottom.
+      - Trying to compensate from outside the window (shifting it up by
+        the title bar's height, growing height to match) didn't help --
+        macOS appears to refuse moving a normal window's title bar fully
+        off-screen, clamping it back, so the strip persisted regardless
+        of how the offset was tuned.
+      - cv2's own native fullscreen mode
+        (cv2.WND_PROP_FULLSCREEN/WINDOW_FULLSCREEN) was tried twice as an
+        alternative and failed both times -- stuck on a blank/gray frame
+        with no content, and on one attempt it also fullscreened on the
+        wrong monitor entirely, ignoring the window's actual position.
+      - cv2.getWindowImageRect(), used to diagnose all of the above,
+        turned out to report coordinates in Retina-scaled physical
+        pixels while moveWindow/resizeWindow accept plain points
+        (matching screeninfo) -- so comparing the two directly produced
+        nonsense numbers, which is part of why the title-bar
+        compensation attempt above couldn't be made to work reliably.
+    A Tkinter window created with overrideredirect(True) has no title
+    bar or border in the first place, so there's nothing to compensate
+    for, and its geometry() position/size describes the content area
+    directly rather than an outer frame. This sidesteps the whole
+    problem rather than working around it.
 
 Usage:
     from slm_display import SLMDisplay, load_masks_from_folder
@@ -50,6 +81,7 @@ Not implemented here (flagged for later, out of scope for this pass):
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -64,6 +96,11 @@ try:
     from screeninfo import get_monitors
 except ImportError:
     get_monitors = None
+
+try:
+    import tkinter as tk
+except ImportError:
+    tk = None
 
 
 class SLMError(RuntimeError):
@@ -85,7 +122,10 @@ def load_masks_from_folder(
             fails to load as an image.
     """
     if cv2 is None:
-        raise SLMError("opencv-python is not installed. Run: pip install opencv-python")
+        raise SLMError(
+            "opencv-python(-headless) is not installed. Run: "
+            "pip install opencv-python-headless"
+        )
 
     folder = Path(folder)
     paths = sorted(folder.glob(pattern))
@@ -101,8 +141,26 @@ def load_masks_from_folder(
     return masks
 
 
+def _ndarray_to_pgm_bytes(arr: np.ndarray) -> bytes:
+    """Encode a uint8 grayscale array as binary PGM (P5) bytes.
+
+    tkinter.PhotoImage can load PGM natively, which lets masks reach the
+    screen without adding a Pillow dependency just for this one
+    conversion.
+    """
+    arr = np.ascontiguousarray(arr, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    header = f"P5\n{w} {h}\n255\n".encode("ascii")
+    return header + arr.tobytes()
+
+
 class SLMDisplay:
-    """Shows a sequence of amplitude masks full-screen on the SLM's monitor."""
+    """Shows a sequence of amplitude masks full-screen on the SLM's monitor.
+
+    Displays via a borderless (overrideredirect) Tkinter window -- see
+    the module docstring's "Why Tkinter" section for why this replaced an
+    earlier OpenCV-window-based implementation.
+    """
 
     def __init__(
         self,
@@ -110,6 +168,8 @@ class SLMDisplay:
         monitor_index: Optional[int] = None,
         window_name: str = "SLM",
         expected_size: Optional[Tuple[int, int]] = (1920, 1080),
+        mirrored: bool = False,
+        master=None,
     ):
         """Prepare (but don't yet display) a sequence of masks.
 
@@ -119,24 +179,62 @@ class SLMDisplay:
                 build this from a directory of image files.
             monitor_index: Which monitor (0-based, per
                 screeninfo.get_monitors()) is the SLM. If None, open()
-                auto-picks the first *non-primary* monitor it finds --
-                fine with exactly one external display connected,
-                ambiguous with more than one.
-            window_name: OpenCV window title -- irrelevant once
-                fullscreen, only visible briefly while the window is created.
+                auto-picks the first *non-primary* monitor it finds (or,
+                if mirrored=True, the primary one instead) -- fine with
+                exactly one external display connected, ambiguous with
+                more than one. Takes priority over mirrored if both are
+                set.
+            window_name: Kept for API compatibility with the previous
+                cv2-based implementation; a borderless window has no
+                title bar to display it in, so this is currently unused.
             expected_size: (width, height) every mask must match -- the
                 SLM's native panel resolution. Pass None to skip this
                 check (e.g. if you intend to pre-scale masks yourself);
                 not recommended for a hard-edged amplitude mask, since
                 resizing can blur sharp edges into intermediate gray
                 values that aren't a real amplitude level.
+            mirrored: Set True if the SLM's display is currently set to
+                MIRROR the primary screen (same image on both), rather
+                than extend the desktop. This is a fallback for when
+                extending genuinely isn't available -- with mirroring
+                on, filling the *primary* screen fully fills the SLM too,
+                since it shows an identical copy. When True, open()
+                covers the primary monitor fully instead of hunting for
+                a non-primary one. Prefer extend-desktop mode (the
+                default) when you can, since mirroring forces both
+                screens to the same resolution/aspect ratio, which may
+                not match the SLM's native panel pixel-for-pixel.
+            master: An existing tkinter widget (typically a Tk() root
+                from a larger app, e.g. a control-panel GUI) to create
+                this display as a child Toplevel of, instead of its own
+                independent Tk() root. A process should generally only
+                ever have one real Tk() root; pass the app's root here
+                when SLMDisplay is used alongside other Tkinter UI so
+                the SLM window becomes a Toplevel sharing that
+                interpreter rather than a second, separate one. Leave as
+                None for standalone use (e.g. the test_on_hardware_*.py
+                scripts), where SLMDisplay creates and owns its own Tk().
 
         Raises:
-            SLMError: if opencv isn't installed, no masks were given, or
-                a mask doesn't match expected_size.
+            SLMError: if tkinter or opencv isn't installed, no masks were
+                given, or a mask doesn't match expected_size.
         """
+        if tk is None:
+            raise SLMError(
+                "tkinter is not available in this Python installation. "
+                "It's normally part of the standard library, but some "
+                "conda/pyenv builds omit the Tk bindings. Try `conda "
+                "install -c conda-forge tk`, or rebuild this environment "
+                "from a conda-forge Python (which normally bundles Tk "
+                "support), then check with `python3 -c \"import "
+                "tkinter\"`."
+            )
         if cv2 is None:
-            raise SLMError("opencv-python is not installed. Run: pip install opencv-python")
+            raise SLMError(
+                "opencv-python(-headless) is not installed (only needed "
+                "for loading mask images from files). Run: "
+                "pip install opencv-python-headless"
+            )
         if not masks:
             raise SLMError("At least one mask is required.")
 
@@ -155,17 +253,18 @@ class SLMDisplay:
         self.masks = list(masks)
         self.monitor_index = monitor_index
         self.window_name = window_name
+        self.mirrored = mirrored
+        self.master = master
         self._is_open = False
         self._current_index: Optional[int] = None
         self._stop_requested = False
+        self._root = None
+        self._label = None
+        self._photos: List = []
 
-    def open(self) -> None:
-        """Find the SLM's monitor and create a fullscreen window on it.
-
-        Raises:
-            SLMError: if screeninfo isn't installed, or no suitable
-                monitor is found.
-        """
+    def _find_monitor(self):
+        """Pick the target monitor per monitor_index/mirrored, same logic
+        as before -- only how it's *used* (window backend) changed."""
         if get_monitors is None:
             raise SLMError("screeninfo is not installed. Run: pip install screeninfo")
 
@@ -179,68 +278,96 @@ class SLMDisplay:
                     f"monitor_index={self.monitor_index} but only "
                     f"{len(monitors)} monitor(s) detected."
                 )
-            monitor = monitors[self.monitor_index]
-        else:
-            # Default: first non-primary monitor -- the SLM is virtually
-            # always the *extended* display, not the laptop's own screen.
-            non_primary = [m for m in monitors if not getattr(m, "is_primary", False)]
-            if not non_primary:
-                raise SLMError(
-                    "No secondary monitor detected -- is the SLM plugged "
-                    "in and set to extend (not mirror) the desktop? Pass "
-                    "monitor_index explicitly to override this check."
-                )
-            monitor = non_primary[0]
+            return monitors[self.monitor_index]
 
-        # macOS's native OpenCV fullscreen mode (WINDOW_FULLSCREEN) is
-        # unreliable in practice -- it can leave the window permanently
-        # stuck on a blank/gray transitional frame no matter how much the
-        # event loop is pumped afterward. Instead, size and position a
-        # normal window to exactly cover the SLM's monitor, skipping the
-        # native fullscreen transition entirely. The only cosmetic cost is
-        # a thin title bar; it doesn't affect the image data reaching the
-        # SLM panel itself.
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.waitKey(1)  # let the window fully materialize before moving it
+        if self.mirrored:
+            primary = [m for m in monitors if getattr(m, "is_primary", False)]
+            if not primary:
+                raise SLMError("No primary monitor detected (unexpected).")
+            return primary[0]
 
-        # Some window managers only loosely honor the first geometry
-        # request (especially across displays with an unusual relative
-        # offset), so reassert position+size a few times with the event
-        # loop pumped in between, rather than trusting a single call.
-        # Sized to 1512x982 (Rika's primary screen's own resolution) rather
-        # than the SLM's native 1920x1080, so the window fits entirely
-        # on-screen and can be seen/dragged/resized in full while cross-
-        # monitor placement is still being sorted out. The mask image
-        # itself is still 1920x1080 -- cv2 scales it down to fit this
-        # window, so proportions are preserved, just not pixel-exact to
-        # the SLM's native resolution. Once the window reliably lands on
-        # the SLM's own monitor, switch this back to monitor.width/height
-        # so each mask pixel maps 1:1 to a panel pixel.
-        window_w, window_h = 1512, 982
-        for _ in range(5):
-            cv2.moveWindow(self.window_name, monitor.x, monitor.y)
-            cv2.resizeWindow(self.window_name, window_w, window_h)
-            cv2.waitKey(50)
+        non_primary = [m for m in monitors if not getattr(m, "is_primary", False)]
+        if not non_primary:
+            raise SLMError(
+                "No secondary monitor detected -- is the SLM plugged "
+                "in and set to extend (not mirror) the desktop? Pass "
+                "monitor_index explicitly to override this check, or "
+                "mirrored=True if the SLM is set to mirror instead."
+            )
+        return non_primary[0]
 
-        cv2.imshow(self.window_name, self.masks[0])
-        for _ in range(15):
-            cv2.waitKey(30)
+    def open(self) -> None:
+        """Find the SLM's monitor and create a borderless window on it.
+
+        Raises:
+            SLMError: if screeninfo isn't installed, or no suitable
+                monitor is found.
+        """
+        monitor = self._find_monitor()
+
+        self._root = tk.Toplevel(self.master) if self.master is not None else tk.Tk()
+
+        # Force 1 point == 1 pixel. Applied on self._root.tk either way:
+        # a Toplevel shares its master's Tcl interpreter, so this sets
+        # scaling for the whole app (control-panel GUI included) when
+        # master is given, which is what we want -- consistent,
+        # unscaled pixel math everywhere, not just in this window. Without this, Tk can inherit a DPI
+        # "points per pixel" scaling factor (often 2.0) from the primary
+        # Retina display and apply it globally, even to a window living
+        # on a different, non-Retina monitor -- which shrinks the
+        # PhotoImage's rendered size relative to the window's own
+        # geometry (also specified in points) and left an even gap of
+        # blank window around the mask on all sides. This is the same
+        # flavor of points-vs-pixels mismatch that made
+        # cv2.getWindowImageRect() unusable earlier, just showing up in
+        # a different place now that the backend has changed.
+        self._root.tk.call("tk", "scaling", 1.0)
+
+        self._root.overrideredirect(True)  # no title bar, no border at all
+        self._root.geometry(
+            f"{monitor.width}x{monitor.height}+{monitor.x}+{monitor.y}"
+        )
+        self._root.configure(background="black")
+        try:
+            self._root.attributes("-topmost", True)
+        except Exception:
+            pass  # not critical if the window manager doesn't support this
+
+        self._photos = [
+            # No format= given: Tk auto-detects PGM from the "P5" magic
+            # number in the header. (Explicitly passing format="PGM"
+            # raises TclError -- Tk's built-in netpbm reader identifies
+            # itself as "PPM" and covers PBM/PGM/PPM together, but
+            # auto-detection sidesteps needing to know that.)
+            tk.PhotoImage(data=_ndarray_to_pgm_bytes(mask))
+            for mask in self.masks
+        ]
+
+        self._label = tk.Label(
+            self._root,
+            image=self._photos[0],
+            bd=0,
+            highlightthickness=0,
+            background="black",
+        )
+        self._label.pack(fill="both", expand=True)
+
+        # Esc or 'q' stops a running run_sequence() early, same as before.
+        self._root.bind("<Escape>", lambda _e: self.stop_sequence())
+        self._root.bind("q", lambda _e: self.stop_sequence())
+
+        self._root.update_idletasks()
+        self._root.update()
+        self._root.focus_force()
 
         self._is_open = True
         self._current_index = 0
 
-        # Report where the window actually ended up vs. where it was
-        # asked to go -- if these don't match, positioning isn't landing
-        # correctly on this machine and needs a different fix.
-        try:
-            actual_rect = cv2.getWindowImageRect(self.window_name)
-            print(
-                f"[SLM] Requested monitor at ({monitor.x}, {monitor.y}), "
-                f"window size {window_w}x{window_h}. Window now "
-                f"reports rect (x, y, w, h) = {actual_rect}."
-            )
-        except Exception:
-            pass
+        print(
+            f"[SLM] Requested monitor at ({monitor.x}, {monitor.y}), size "
+            f"{monitor.width}x{monitor.height}. Borderless window geometry "
+            f"now reports: {self._root.geometry()!r}."
+        )
 
     def show_mask(self, index: int) -> None:
         """Display masks[index] immediately, replacing whatever was shown before.
@@ -253,8 +380,10 @@ class SLMDisplay:
         if not (0 <= index < len(self.masks)):
             raise SLMError(f"Mask index {index} out of range (0-{len(self.masks) - 1}).")
 
-        cv2.imshow(self.window_name, self.masks[index])
-        cv2.waitKey(1)  # pump the GUI event loop so the image actually paints
+        self._label.configure(image=self._photos[index])
+        self._label.image = self._photos[index]  # keep a live reference
+        self._root.update_idletasks()
+        self._root.update()
         self._current_index = index
 
     def run_sequence(
@@ -267,10 +396,9 @@ class SLMDisplay:
 
         This is a BLOCKING call -- it owns the calling thread until the
         sequence ends (cycles reached) or stop_sequence() flags it to stop,
-        because cv2's GUI calls must run on the main thread on some
-        platforms (macOS in particular). If the display needs to run in
-        the background, run this from its own process rather than a
-        Python thread.
+        because Tkinter's GUI calls must run on the main thread. If the
+        display needs to run in the background, run this from its own
+        process rather than a Python thread.
 
         Args:
             interval_s: Seconds to show each mask before advancing to the
@@ -291,7 +419,7 @@ class SLMDisplay:
             raise SLMError("Display is not open. Call open() first.")
 
         if isinstance(interval_s, (int, float)):
-            intervals_ms = [max(1, int(interval_s * 1000))] * len(self.masks)
+            intervals_s = [max(0.001, float(interval_s))] * len(self.masks)
         else:
             intervals = list(interval_s)
             if len(intervals) != len(self.masks):
@@ -300,21 +428,22 @@ class SLMDisplay:
                     f"{len(self.masks)} masks -- provide one number for all "
                     f"masks, or one entry per mask."
                 )
-            intervals_ms = [max(1, int(s * 1000)) for s in intervals]
+            intervals_s = [max(0.001, float(s)) for s in intervals]
 
         self._stop_requested = False
         completed_cycles = 0
+        poll_s = 0.03  # how often to pump the Tk event loop while waiting
 
         while not self._stop_requested:
             for i in range(len(self.masks)):
                 if self._stop_requested:
                     break
                 self.show_mask(i)
-                # waitKey() both waits out the interval AND keeps the GUI
-                # responsive; pressing Esc/q doubles as a manual stop.
-                key = cv2.waitKey(intervals_ms[i]) & 0xFF
-                if key in (27, ord("q")):
-                    self._stop_requested = True
+                elapsed = 0.0
+                while elapsed < intervals_s[i] and not self._stop_requested:
+                    self._root.update()  # keeps the window responsive to Esc/q
+                    time.sleep(poll_s)
+                    elapsed += poll_s
 
             completed_cycles += 1
             if not loop or (cycles is not None and completed_cycles >= cycles):
@@ -330,9 +459,15 @@ class SLMDisplay:
         Safe to call multiple times / after a failed open().
         """
         if self._is_open:
-            cv2.destroyWindow(self.window_name)
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
             self._is_open = False
         self._current_index = None
+        self._root = None
+        self._label = None
+        self._photos = []
 
     def __enter__(self):
         """`with SLMDisplay(masks) as slm:` shortcut for open()."""

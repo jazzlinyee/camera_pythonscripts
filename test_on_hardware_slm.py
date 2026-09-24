@@ -7,11 +7,18 @@ laptop screen) and lets you try different masks/intervals interactively
 before committing to a real experiment.
 
 Requires the non-headless opencv-python + screeninfo (see slm_display.py's
-module docstring for the package-swap steps) and the SLM connected as an
-extended-desktop display (not mirrored).
+module docstring for the package-swap steps). Works with the SLM connected
+either as an extended-desktop display (default) or mirroring your laptop
+screen (pass --mirrored) -- see slm_display.py's SLMDisplay docstring for
+why mirrored mode exists and when to stop using it.
 
 Run:
-    python3 test_on_hardware_slm.py [masks_folder]
+    python3 test_on_hardware_slm.py [--mirrored] [masks_folder]
+
+The display window is borderless (no title bar) via Tkinter -- see
+slm_display.py's module docstring ("Why Tkinter") for why this replaced
+an earlier OpenCV-window-based implementation that couldn't reliably
+get rid of its title bar on macOS.
 
 If masks_folder is given, loads real masks from it (see
 load_masks_from_folder()'s docstring for naming/sizing rules). If omitted,
@@ -49,16 +56,28 @@ def make_test_masks():
                 checkerboard[row : row + block, col : col + block] = 255
 
     stripes = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
-    stripes[:, ::20] = 255
+    # 20px-wide white/black bands (was 1px-wide lines every 20px, which was
+    # too thin to see clearly through the optical path) -- 50% duty cycle,
+    # 40px period.
+    stripe_width = 20
+    for col in range(0, WIDTH, stripe_width * 2):
+        stripes[:, col : col + stripe_width] = 255
 
     return [checkerboard, white, black, stripes]
 
 
 def main():
-    if len(sys.argv) > 1:
-        print(f"Loading masks from {sys.argv[1]}...")
+    args = sys.argv[1:]
+    mirrored = "--mirrored" in args
+    args = [a for a in args if a != "--mirrored"]
+
+    if mirrored:
+        print("--mirrored passed -- targeting the primary monitor (SLM assumed to be mirroring it).")
+
+    if len(args) > 0:
+        print(f"Loading masks from {args[0]}...")
         try:
-            masks = load_masks_from_folder(sys.argv[1])
+            masks = load_masks_from_folder(args[0])
         except SLMError as e:
             print(f"Could not load masks: {e}")
             sys.exit(1)
@@ -72,7 +91,7 @@ def main():
     print(f"{len(masks)} mask(s) loaded.")
 
     try:
-        slm = SLMDisplay(masks)
+        slm = SLMDisplay(masks, mirrored=mirrored)
         slm.open()
     except SLMError as e:
         print(f"Failed to open display: {e}")
