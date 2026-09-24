@@ -251,6 +251,7 @@ class SLMDisplay:
                     )
 
         self.masks = list(masks)
+        self.expected_size = expected_size
         self.monitor_index = monitor_index
         self.window_name = window_name
         self.mirrored = mirrored
@@ -261,6 +262,112 @@ class SLMDisplay:
         self._root = None
         self._label = None
         self._photos: List = []
+
+    def add_mask(self, mask: np.ndarray) -> int:
+        """Add one more mask after any already loaded, returning its index.
+
+        Works whether or not open() has been called yet. If the display
+        is already open, the new mask becomes immediately selectable via
+        show_mask() -- no need to close and reopen. Validated against the
+        same expected_size the constructor used (None skips the check,
+        same as the constructor).
+
+        Raises:
+            SLMError: if the mask's size doesn't match expected_size.
+        """
+        if self.expected_size is not None:
+            want_w, want_h = self.expected_size
+            h, w = mask.shape[:2]
+            if (w, h) != (want_w, want_h):
+                raise SLMError(
+                    f"New mask is {w}x{h}, expected {want_w}x{want_h} "
+                    f"(the SLM's native resolution). Pass "
+                    f"expected_size=None at construction to skip this "
+                    f"check if that's intentional."
+                )
+
+        self.masks.append(mask)
+        if self._is_open:
+            self._photos.append(tk.PhotoImage(data=_ndarray_to_pgm_bytes(mask)))
+        return len(self.masks) - 1
+
+    def remove_mask(self, index: int):
+        """Remove one mask by index (at least one mask must always remain).
+
+        Works whether or not open() has been called yet. If the display
+        is already open and the removed mask was the one on screen, falls
+        back to showing mask 0 of what remains, rather than leaving a
+        stale or missing image up; otherwise the display keeps showing
+        whatever it was already showing (index-adjusted if the removed
+        mask came before it in the list).
+
+        Returns:
+            The index now actually showing, if the display is open
+            (already re-painted if it changed); None if not open yet.
+
+        Raises:
+            SLMError: if this would remove the last remaining mask, or
+                index is out of range.
+        """
+        if len(self.masks) <= 1:
+            raise SLMError("Can't remove the last remaining mask -- at least one is required.")
+        if not (0 <= index < len(self.masks)):
+            raise SLMError(f"Mask index {index} out of range (0-{len(self.masks) - 1}).")
+
+        del self.masks[index]
+        if not self._is_open:
+            return None
+
+        del self._photos[index]
+        if self._current_index == index:
+            new_index = 0
+            self.show_mask(new_index)
+        else:
+            new_index = self._current_index
+            if new_index is not None and new_index > index:
+                new_index -= 1
+                self._current_index = new_index
+        return new_index
+
+    def set_masks(self, new_masks) -> None:
+        """Replace the whole mask list in one go -- e.g. after re-scanning
+        a mask folder on disk for changes made outside this process
+        (files added, removed, renamed, or dragged between folders in
+        Finder), rather than tracking each change one at a time via
+        add_mask()/remove_mask(). Requires at least one mask.
+
+        If the display is already open, rebuilds the cached PhotoImages
+        and keeps showing whatever index was already current if that
+        index still exists in the new list (clamped to a valid index
+        otherwise), so a routine refresh doesn't blank the screen or jump
+        back to mask 0 unnecessarily.
+
+        Raises:
+            SLMError: if new_masks is empty, or (when expected_size is
+                set) any mask doesn't match it.
+        """
+        if not new_masks:
+            raise SLMError("At least one mask is required.")
+        if self.expected_size is not None:
+            want_w, want_h = self.expected_size
+            for i, mask in enumerate(new_masks):
+                h, w = mask.shape[:2]
+                if (w, h) != (want_w, want_h):
+                    raise SLMError(
+                        f"Mask {i} is {w}x{h}, expected {want_w}x{want_h} "
+                        f"(the SLM's native resolution)."
+                    )
+
+        self.masks = list(new_masks)
+        if not self._is_open:
+            return
+
+        self._photos = [
+            tk.PhotoImage(data=_ndarray_to_pgm_bytes(mask)) for mask in self.masks
+        ]
+        if self._current_index is None or self._current_index >= len(self.masks):
+            self._current_index = 0
+        self.show_mask(self._current_index)
 
     def _find_monitor(self):
         """Pick the target monitor per monitor_index/mirrored, same logic
