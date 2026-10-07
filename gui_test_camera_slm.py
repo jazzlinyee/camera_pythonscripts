@@ -41,7 +41,11 @@ this app):
 
 Layout:
     - Camera panel: pick Blackfly/Basler, optional serial, open/close,
-      set/read exposure, capture. Blackfly and Basler are independent
+      set/read exposure, capture. "File name" names the saved photos
+      (blank = auto-numbered blackfly_000...; Capture Both adds
+      _blackfly/_basler; Auto Cycle adds the mask name and exposure;
+      an existing file is never overwritten -- _2, _3... is added) and
+      "Save to" picks the folder (default ./test_captures). Blackfly and Basler are independent
       slots -- both can be open at once, which is what Capture Both
       needs (a back-to-back, non-hardware-synced shot from each).
     - SLM panel: open/close the display; "Add Folder...", "Remove
@@ -96,6 +100,9 @@ from slm_display import SLMDisplay, SLMError
 from test_on_hardware_slm import HEIGHT, WIDTH, make_test_masks
 
 OUTPUT_DIR = Path("test_captures")
+# Characters that can't safely appear in a file name on macOS/Windows/Linux --
+# replaced with "_" when cleaning a user-typed capture name.
+FILENAME_BAD_CHARS = set('/:*?"<>|') | {chr(92)}
 FOLDER_CONFIG_PATH = Path("mask_folders.json")  # remembers registered mask folders across runs
 THUMB_W, THUMB_H = 340, 230  # bumped up 2026-09-22 so the bigger window has room to use
 DEFAULT_MASK_NAMES = ["checkerboard", "white", "black", "stripes"]
@@ -154,6 +161,7 @@ class App:
         # a time, but not once dual capture is a thing).
         self.cams = {"blackfly": None, "basler": None}
         self.shots = {"blackfly": 0, "basler": 0}
+        self.save_dir = OUTPUT_DIR  # where captures are written; changed via "Choose..."
 
         self.slm = None
 
@@ -218,10 +226,29 @@ class App:
         self.exposure_label = ttk.Label(cam_frame, text="Current exposure: --")
         self.exposure_label.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
 
+        ttk.Label(cam_frame, text="File name:").grid(row=4, column=0, sticky="e")
+        self.filename_entry = ttk.Entry(cam_frame, width=26)
+        self.filename_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=6)
+        ttk.Label(
+            cam_frame,
+            text="blank = auto-numbered (blackfly_000...)",
+            foreground="gray40",
+        ).grid(row=5, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(cam_frame, text="Save to:").grid(row=6, column=0, sticky="e")
+        self.save_dir_label = ttk.Label(
+            cam_frame, text=str(self.save_dir), wraplength=200, justify="left"
+        )
+        self.save_dir_label.grid(row=6, column=1, sticky="w", padx=6)
+        self.choose_save_dir_btn = ttk.Button(
+            cam_frame, text="Choose...", command=self.choose_save_folder
+        )
+        self.choose_save_dir_btn.grid(row=6, column=2, sticky="w")
+
         self.capture_btn = ttk.Button(
             cam_frame, text="Capture", command=self.capture, state="disabled"
         )
-        self.capture_btn.grid(row=4, column=0, columnspan=3, pady=(10, 0))
+        self.capture_btn.grid(row=7, column=0, columnspan=3, pady=(10, 0))
 
         self.capture_both_btn = ttk.Button(
             cam_frame,
@@ -229,12 +256,12 @@ class App:
             command=self.capture_both,
             state="disabled",
         )
-        self.capture_both_btn.grid(row=5, column=0, columnspan=3, pady=(0, 4))
+        self.capture_both_btn.grid(row=8, column=0, columnspan=3, pady=(0, 4))
         ttk.Label(
             cam_frame,
             text="(back-to-back, not hardware-synced)",
             foreground="gray40",
-        ).grid(row=6, column=0, columnspan=3, pady=(0, 10))
+        ).grid(row=9, column=0, columnspan=3, pady=(0, 10))
 
         slm_frame = ttk.LabelFrame(self.root, text="SLM")
         slm_frame.grid(row=0, column=1, sticky="nsew", **pad)
@@ -545,10 +572,76 @@ class App:
         except CameraError as e:
             self.log(f"Could not read exposure: {e}")
 
-    def capture(self):
-        self._capture_one(self.cam_choice.get())
+    def choose_save_folder(self):
+        """Pick the folder captures are saved into (default ./test_captures).
+        Applies to every capture from here on -- manual, Capture Both, and
+        Auto Cycle."""
+        start = self.save_dir if self.save_dir.is_dir() else Path.home()
+        folder = filedialog.askdirectory(
+            title="Choose a folder to save photos into", initialdir=str(start)
+        )
+        if not folder:
+            return
+        self.save_dir = Path(folder)
+        self.save_dir_label.configure(text=str(self.save_dir))
+        self.log(f"Photos will now be saved to {self.save_dir}")
 
-    def capture_both(self):
+    @staticmethod
+    def _clean_filename(raw: str) -> str:
+        """Turn whatever was typed in the File name box into a safe file-name
+        stem: trims spaces, drops a typed .png/.tif/.tiff (the extension is
+        fixed per camera), and swaps characters that aren't allowed in file
+        names for '_'. Returns "" if nothing usable is left."""
+        name = raw.strip()
+        for typed_ext in (".png", ".tiff", ".tif"):
+            if name.lower().endswith(typed_ext):
+                name = name[: -len(typed_ext)]
+                break
+        name = "".join(
+            "_" if (ch in FILENAME_BAD_CHARS or not ch.isprintable()) else ch for ch in name
+        )
+        return name.strip(" .")
+
+    def _next_capture_path(self, choice: str, suffix_camera: bool = False, extra: str = ""):
+        """Work out where the next photo from `choice` should be saved.
+
+        - File name box blank: the original auto-numbering, blackfly_000.png,
+          blackfly_001.png, ... (skipping any number already on disk so a
+          chosen folder's existing photos are never overwritten).
+        - File name given: <name>.<ext>. `suffix_camera` (Capture Both /
+          Auto Cycle with both cameras) adds _blackfly / _basler so the two
+          shots don't collide, and `extra` (Auto Cycle: mask name + exposure)
+          is appended too. If that file already exists, _2, _3, ... is added
+          rather than overwriting it.
+        """
+        ext = CAM_CLASSES[choice][1]
+        base = self._clean_filename(self.filename_entry.get())
+        folder = self.save_dir
+        folder.mkdir(parents=True, exist_ok=True)
+
+        if not base:
+            while (folder / f"{choice}_{self.shots[choice]:03d}{ext}").exists():
+                self.shots[choice] += 1
+            return folder / f"{choice}_{self.shots[choice]:03d}{ext}"
+
+        parts = [base]
+        if suffix_camera:
+            parts.append(choice)
+        extra = self._clean_filename(extra)
+        if extra:
+            parts.append(extra)
+        stem = "_".join(parts)
+        path = folder / f"{stem}{ext}"
+        n = 2
+        while path.exists():
+            path = folder / f"{stem}_{n}{ext}"
+            n += 1
+        return path
+
+    def capture(self, extra=""):
+        self._capture_one(self.cam_choice.get(), extra=extra)
+
+    def capture_both(self, extra=""):
         """Capture from both cameras, one right after the other. This is
         NOT a hardware-synced simultaneous trigger -- there's no shared
         trigger line wired up between these two USB3 Vision cameras in
@@ -560,16 +653,18 @@ class App:
             self.log("Capture Both needs both cameras open.")
             return
         self.log("Capturing both cameras back-to-back (not hardware-synced).")
-        self._capture_one("blackfly")
-        self._capture_one("basler")
+        self._capture_one("blackfly", suffix_camera=True, extra=extra)
+        self._capture_one("basler", suffix_camera=True, extra=extra)
 
-    def _capture_one(self, choice: str):
+    def _capture_one(self, choice: str, suffix_camera: bool = False, extra: str = ""):
         cam = self.cams[choice]
         if cam is None:
             return None
-        ext = CAM_CLASSES[choice][1]
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        path = OUTPUT_DIR / f"{choice}_{self.shots[choice]:03d}{ext}"
+        try:
+            path = self._next_capture_path(choice, suffix_camera=suffix_camera, extra=extra)
+        except OSError as e:
+            self.log(f"Can't use the save folder '{self.save_dir}': {e}")
+            return None
         try:
             saved = cam.capture(path)
         except CameraError as e:
@@ -1140,10 +1235,20 @@ class App:
     def _auto_capture_then_reschedule(self):
         if not self._auto_running:
             return
+        # With a File name set, each Auto Cycle photo is named
+        # <name>_<mask name>[_<exposure>us] so a long run's files stay
+        # distinguishable (blank File name = original auto-numbering).
+        extra_parts = []
+        indices = self._auto_loop_indices()
+        if indices:
+            extra_parts.append(self.mask_names[indices[self._auto_index % len(indices)]])
+        if self._auto_exp_values:
+            extra_parts.append(f"{self._auto_exp_values[self._auto_exp_index]:g}us")
+        extra = "_".join(extra_parts)
         if self.auto_both_var.get():
-            self.capture_both()
+            self.capture_both(extra=extra)
         else:
-            self.capture()
+            self.capture(extra=extra)
         remaining_ms = max(0, self._auto_interval_ms - self._auto_settle_ms)
         self._auto_after_id = self.root.after(remaining_ms, self._auto_cycle_tick)
 

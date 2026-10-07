@@ -346,7 +346,16 @@ otherwise the built-in test patterns are auto-generated into
 `test_patterns/` and registered instead.
 
 **Camera panel**: pick Blackfly or Basler, optional serial, open/close,
-set/read exposure, capture. Both cameras have independent slots — either
+set/read exposure, capture. **File name** sets what saved photos are
+called (blank = the original auto-numbering, `blackfly_000.png`...;
+a typed `.png`/`.tiff` is dropped, since the extension is fixed per
+camera). **Save to / Choose...** picks the folder photos go in (default
+`test_captures/`; created if it doesn't exist yet). With a name typed:
+a single capture is saved as `<name>.png`/`.tiff`, Capture Both adds
+`_blackfly`/`_basler`, and Auto Cycle adds the mask name and (if
+varying) exposure, e.g. `run1_blackfly_checkerboard_500us.png`. Existing
+files are never overwritten — `_2`, `_3`... is added instead. Both
+cameras have independent slots — either
 or both can be open at once ("Capture Both" takes one shot from each,
 back-to-back, explicitly *not* hardware-synced between the two).
 
