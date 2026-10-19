@@ -22,6 +22,10 @@ Capture policy (set after the 2026-09 meeting, revised 2026-09-22):
     format that preserves 16-bit single-channel data losslessly -- .png
     would also work, but .tiff is what's expected here).
 
+    >>> NOTE: the MSB alignment described next is currently switched OFF by
+    >>> MSB_ALIGN_OUTPUT = False (near the top of this file) -- while it is
+    >>> False, saved .tiff values are the raw 0-4095 sensor values (no x16).
+
     MSB-aligned, not LSB-aligned (changed 2026-09-22): each 12-bit sensor
     value is shifted up to occupy the top of the 16-bit range (value*16),
     e.g. a real reading of 188 is stored as 3008. This is a lossless,
@@ -64,6 +68,15 @@ try:
 except ImportError:
     pylon = None
     genicam = None
+
+# Back ON (2026-10-21, at Rika's request) after being temporarily off since 2026-10-09.
+# True  = MSB-aligned .tiff: each 12-bit value is shifted up x16 so the file
+#         looks normally bright in an ordinary viewer (see module docstring).
+# False = no shift: the .tiff holds the raw sensor values, 0-4095, as-is.
+#         Files will look nearly black in an ordinary viewer (that's expected,
+#         the data is fine) and need NO divide-by-16 for analysis.
+# Flip back to True to restore the 2026-09-22 behavior. Nothing else changes.
+MSB_ALIGN_OUTPUT = True
 
 
 class BaslerCamera(Camera):
@@ -142,7 +155,9 @@ class BaslerCamera(Camera):
         # values will read 16x too high versus what was actually measured.
         self._converter = pylon.ImageFormatConverter()
         self._converter.OutputPixelFormat = pylon.PixelType_Mono16
-        self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+        if MSB_ALIGN_OUTPUT:
+            self._converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+        # else: leave pylon's default alignment -- no x16 shift, raw 0-4095.
 
         self._is_open = True
 
@@ -259,6 +274,40 @@ class BaslerCamera(Camera):
             if save_preview:
                 self._save_preview(img_array, save_path)
             return save_path
+        finally:
+            grab_result.Release()
+
+    def grab_preview(self, timeout_ms: int = 20, downsample: int = 1):
+        """Grab the newest frame for a LIVE VIEW, without saving anything.
+
+        Added 2026-10-14 for the GUI's live view; capture() is unchanged.
+        Returns the sensor's raw 12-bit values (0-4095, uint16 numpy
+        array) regardless of MSB_ALIGN_OUTPUT -- this bypasses the saving
+        converter -- or None if no new frame arrived within `timeout_ms`
+        (normal when the exposure is longer than the timeout; just try
+        again). `downsample` keeps every Nth pixel in each direction (a
+        cheap stride, fine for a monochrome sensor) so a 20 MP frame
+        doesn't have to be copied and drawn at full size.
+
+        Raises:
+            CameraError: if start() hasn't been called yet, or the camera
+                reports a real (non-timeout) error.
+        """
+        if not self._is_streaming:
+            raise CameraError("Camera is not streaming. Call start() first.")
+        try:
+            grab_result = self._cam.RetrieveResult(
+                timeout_ms, pylon.TimeoutHandling_ThrowException
+            )
+        except genicam.TimeoutException:
+            return None
+        except genicam.GenericException as e:
+            raise CameraError(f"Live grab failed: {e}") from e
+        try:
+            if not grab_result.GrabSucceeded():
+                return None  # one bad frame in a live stream isn't worth stopping for
+            step = max(1, int(downsample))
+            return grab_result.Array[::step, ::step].copy()
         finally:
             grab_result.Release()
 

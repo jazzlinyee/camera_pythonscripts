@@ -377,7 +377,11 @@ non-blocking timer. "Switch every (ms)" sets the full cycle period,
 "Settle before capture (ms)" sets the pause after each switch before
 capturing (see the settle-time note above). "Loop through" picks one
 registered folder or "All masks" across every folder; folders are
-re-scanned fresh each time you hit Start. "Capture both cameras" makes
+re-scanned fresh each time you hit Start. **Passes** makes the run stop by
+itself after that many full passes (blank or 0 = keep going until you hit
+Stop); one pass is every mask in the loop shown once, or every exposure
+value used once if the exposure list is longer than the mask count, and
+the status line shows "step N of M" while it runs. "Capture both cameras" makes
 each tick capture from both cameras instead of just the selected one.
 Optionally, "Vary exposure each switch" steps exposure in lockstep with
 the mask switches (independently wrapping, so a single-mask loop with
@@ -394,6 +398,32 @@ exclusive modes:
 **Previews and log**: live preview of the current mask plus the most
 recent Blackfly/Basler captures side by side, and a scrolling log panel
 at the bottom recording every action.
+
+**Live view**: a row under the previews with a continuously refreshed
+picture from each open camera. Tick "Blackfly live" / "Basler live" (the
+camera must be open first). It is display only: the Basler view is
+auto-contrast-stretched (raw 12-bit data is very dark otherwise) and the
+Blackfly's raw Bayer mosaic is demosaiced to colour, but saved captures
+are never processed that way. Expect roughly 5-20 frames per second,
+slower with long exposures; it is polled on the GUI thread, so it never
+overlaps a capture or an exposure change. If the Blackfly's live colours
+look swapped (red/blue) or tinted, that is the still-unconfirmed Bayer
+order — change `LIVE_BAYER_TO_BGR` near the top of
+`gui_test_camera_slm.py` to `cv2.COLOR_BayerRG2BGR`. Under the hood each
+camera wrapper has a `grab_preview(timeout_ms, downsample)` method that
+returns the newest frame as an array without saving it.
+
+**Resizable, collapsible layout**: the window is split into the control
+panels (top), the previews (middle: mask | Blackfly | Basler, each with
+its capture over its live view) and the log (bottom), with draggable
+dividers between them. Drag a divider to give an area more room — for
+example, drag the divider under the control panels up, or the one between
+two preview columns sideways, to enlarge the live feed; the thumbnails fill
+their pane (up to the source image's own size). The **Camera / SLM / Auto
+Cycle / Log** buttons in the toolbar row at the very top of the window (the
+ones with the ▾ arrow) collapse or re-open their panel;
+collapsing the control panels hands their height to the previews. If the
+window is narrower than the three control panels need, collapse one.
 
 Single-Tk-root architecture: the main window owns the one `tk.Tk()`; the
 SLM's display window is a child `tk.Toplevel` of it, not a second

@@ -266,6 +266,52 @@ class BlackflyCamera(Camera):
         finally:
             image_result.Release()
 
+    def grab_preview(self, timeout_ms: int = 20, downsample: int = 1):
+        """Grab the newest frame for a LIVE VIEW, without saving anything.
+
+        Added 2026-10-14 for the GUI's live view; capture() is unchanged.
+        Returns the raw 8-bit Bayer mosaic as a 2-D numpy array (same data
+        capture() would save, no demosaic here), or None if no new frame
+        arrived within `timeout_ms` (normal when the exposure is longer
+        than the timeout; just try again). `downsample` is accepted for
+        symmetry with BaslerCamera.grab_preview() but ignored: striding a
+        Bayer mosaic would mix up its colour filter pattern, so shrink the
+        frame AFTER demosaicing instead.
+
+        Raises:
+            CameraError: if start() hasn't been called yet, or the camera
+                reports a real (non-timeout) error.
+        """
+        if not self._is_streaming:
+            raise CameraError("Camera is not streaming. Call start() first.")
+        try:
+            image_result = self._cam.GetNextImage(timeout_ms)
+        except PySpin.SpinnakerException as e:
+            # "No frame yet" is NOT an error here. Spinnaker reports it as
+            # SPINNAKER_ERR_TIMEOUT (-1011) with the message "Failed
+            # waiting for EventData on NEW_BUFFER_DATA event" -- the word
+            # "timeout" is NOT in that text, so match on the code/event
+            # name too. (Matching only "timeout" made the live view stop
+            # as soon as the exposure outlasted the poll interval,
+            # ~50 ms, 2026-10-14.)
+            msg = str(e).lower()
+            code = getattr(e, "errorcode", None)
+            if (
+                code == getattr(PySpin, "SPINNAKER_ERR_TIMEOUT", -1011)
+                or "timeout" in msg
+                or "timed out" in msg
+                or "new_buffer_data" in msg
+                or "-1011" in msg
+            ):
+                return None
+            raise CameraError(f"Live grab failed: {e}") from e
+        try:
+            if image_result.IsIncomplete():
+                return None
+            return image_result.GetNDArray().copy()
+        finally:
+            image_result.Release()
+
     @staticmethod
     def _save_array(img_array, save_path: Path) -> None:
         """Write a numpy image array to disk, preferring OpenCV over Pillow."""

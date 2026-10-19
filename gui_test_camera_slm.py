@@ -70,10 +70,26 @@ Layout:
       microsecond value per line; blank lines and '#' comments are
       ignored) -- useful when you want specific, hand-picked exposure
       values per step rather than an evenly-spaced sweep. "Clear"
-      drops the loaded list and goes back to start/step/end.
+      drops the loaded list and goes back to start/step/end. "Passes"
+      stops the run by itself after that many full passes (blank or 0 =
+      keep going until Stop); a pass is every mask in the loop shown
+      once, or every exposure value used once if that list is longer.
     - Current mask preview, plus separate Blackfly/Basler capture
-      previews.
+      previews, and a Live row under them: tick "Blackfly live" /
+      "Basler live" (camera must be open) for a continuously refreshed
+      picture. Polled on the Tk thread with a short timeout, so it never
+      overlaps a capture; long exposures just give a slower refresh. The
+      Basler view is auto-contrast-stretched and the Blackfly mosaic is
+      demosaiced to colour -- display only, saved files are unchanged.
     - Log panel at the bottom (replaces the old REPL's printed lines).
+
+Resizable layout (changed 2026-10-16): the window is split into the control
+panels (top), the previews (middle: mask | Blackfly | Basler) and the log
+(bottom), with draggable dividers between them -- drag one to give that
+area more room, e.g. enlarge the live feed. The thumbnails fill whatever
+space their pane has. The Camera / SLM / Auto Cycle / Log headers (the
+buttons with the arrow) collapse their panel; collapsing the control
+panels hands their height to the previews.
 
 Only one tkinter root exists in this process (this window) -- the SLM's
 own window is created as a Toplevel of it via SLMDisplay(..., master=...),
@@ -104,7 +120,21 @@ OUTPUT_DIR = Path("test_captures")
 # replaced with "_" when cleaning a user-typed capture name.
 FILENAME_BAD_CHARS = set('/:*?"<>|') | {chr(92)}
 FOLDER_CONFIG_PATH = Path("mask_folders.json")  # remembers registered mask folders across runs
-THUMB_W, THUMB_H = 340, 230  # bumped up 2026-09-22 so the bigger window has room to use
+# Preview thumbnails (mask, both captures, both live views) resize with their pane --
+# drag a divider and they follow; see apply_preview_size(). These bounds keep them readable but never huge.
+PREVIEW_MIN_W, PREVIEW_MIN_H = 120, 80
+PREVIEW_MAX_W, PREVIEW_MAX_H = 1400, 1000
+BASLER_SENSOR_W = 5472  # used only to pick how coarsely to subsample the live Basler frame
+LIVE_GRAB_TIMEOUT_MS = 15  # how long each live poll waits for a new frame
+LIVE_POLL_MS = 40  # gap between live polls (~15-25 fps at most; slower with long exposures)
+LIVE_BASLER_DOWNSAMPLE = 8  # keep every 8th pixel of the 20 MP Basler frame for display
+# Live-view-only colour conversion for the Blackfly's raw Bayer mosaic. OpenCV names
+# its Bayer codes after the opposite corner, so an RGGB sensor (the
+# PixelFormat_BayerRG8 assumed in blackfly_camera.py) uses the "BG" code. The camera's
+# real Bayer order is still unconfirmed -- if live colours look swapped (red<->blue)
+# or tinted, try cv2.COLOR_BayerRG2BGR here. Saved captures are never affected.
+LIVE_BAYER_TO_BGR = cv2.COLOR_BayerBG2BGR
+THUMB_W, THUMB_H = 260, 176  # starting preview size; apply_preview_size() resizes to the panes
 DEFAULT_MASK_NAMES = ["checkerboard", "white", "black", "stripes"]
 MASK_EXPECTED_SIZE = (WIDTH, HEIGHT)  # the SLM panel's native resolution
 MASK_IMAGE_GLOBS = ("*.png", "*.tif", "*.tiff", "*.bmp", "*.jpg", "*.jpeg")
@@ -162,6 +192,14 @@ class App:
         self.cams = {"blackfly": None, "basler": None}
         self.shots = {"blackfly": 0, "basler": 0}
         self.save_dir = OUTPUT_DIR  # where captures are written; changed via "Choose..."
+        self._live_after_ids = {"blackfly": None, "basler": None}
+        self._live_photos = {"blackfly": None, "basler": None}  # keep PhotoImages alive
+        # Current preview thumbnail box per column; updated by apply_preview_size() as panes are resized.
+        self.preview_sizes = {k: (THUMB_W, THUMB_H) for k in ("mask", "blackfly", "basler")}
+        self._blank_photos = {}
+        self._current_mask_index = None  # what the mask preview shows (re-rendered on resize)
+        self._last_capture_path = {"blackfly": None, "basler": None}  # same, for capture previews
+        self._resize_after_id = None
 
         self.slm = None
 
@@ -178,6 +216,8 @@ class App:
         self._auto_exp_values = None  # None = exposure variation off for this run
         self._auto_exp_file_values = None  # loaded from a text file -- takes
         self._auto_exp_file_name = None    # precedence over start/step/end if set
+        self._auto_ticks_done = 0
+        self._auto_ticks_limit = None  # None = keep going until Stop is clicked
 
         root.title("Camera + SLM control panel")
         self._build_widgets()
@@ -188,9 +228,12 @@ class App:
 
     def _build_widgets(self):
         pad = {"padx": 6, "pady": 4}
+        self._build_panes()
 
-        cam_frame = ttk.LabelFrame(self.root, text="Camera")
-        cam_frame.grid(row=0, column=0, sticky="nsew", **pad)
+        cam_wrap = ttk.Frame(self.top_section)
+        cam_wrap.grid(row=0, column=0, sticky="nsew", **pad)
+        cam_frame = ttk.LabelFrame(cam_wrap, text="Camera")
+        self._attach_collapsible(cam_wrap, cam_frame, "Camera", self._reflow_top_pane, column=0)
 
         self.cam_choice = tk.StringVar(value="blackfly")
         # Set/Capture/Open/Close act on whichever radio is selected --
@@ -263,8 +306,10 @@ class App:
             foreground="gray40",
         ).grid(row=9, column=0, columnspan=3, pady=(0, 10))
 
-        slm_frame = ttk.LabelFrame(self.root, text="SLM")
-        slm_frame.grid(row=0, column=1, sticky="nsew", **pad)
+        slm_wrap = ttk.Frame(self.top_section)
+        slm_wrap.grid(row=0, column=1, sticky="nsew", **pad)
+        slm_frame = ttk.LabelFrame(slm_wrap, text="SLM")
+        self._attach_collapsible(slm_wrap, slm_frame, "SLM", self._reflow_top_pane, column=1)
         self.slm_frame = slm_frame
 
         self.open_slm_btn = ttk.Button(slm_frame, text="Open SLM", command=self.open_slm)
@@ -302,8 +347,10 @@ class App:
         self.mask_tree.configure(yscrollcommand=tree_scroll.set)
         self.mask_tree.bind("<Double-Button-1>", self._on_mask_tree_double_click)
 
-        auto_frame = ttk.LabelFrame(self.root, text="Auto Cycle")
-        auto_frame.grid(row=0, column=2, sticky="nsew", **pad)
+        auto_wrap = ttk.Frame(self.top_section)
+        auto_wrap.grid(row=0, column=2, sticky="nsew", **pad)
+        auto_frame = ttk.LabelFrame(auto_wrap, text="Auto Cycle")
+        self._attach_collapsible(auto_wrap, auto_frame, "Auto Cycle", self._reflow_top_pane, column=2)
 
         ttk.Label(auto_frame, text="Switch every (ms):").grid(row=0, column=0, sticky="e")
         self.auto_interval_entry = ttk.Entry(auto_frame, width=8)
@@ -322,11 +369,20 @@ class App:
         )
         self.auto_set_combo.grid(row=2, column=1, sticky="w")
 
+        ttk.Label(auto_frame, text="Passes (blank = until stopped):").grid(
+            row=3, column=0, sticky="e"
+        )
+        # One pass = every mask in the loop shown once (or, if exposure is
+        # being varied, every exposure value used once if that list is
+        # longer than the mask count). Blank or 0 keeps cycling until Stop.
+        self.auto_passes_entry = ttk.Entry(auto_frame, width=8)
+        self.auto_passes_entry.grid(row=3, column=1, sticky="w")
+
         self.auto_both_var = tk.BooleanVar(value=False)
         self.auto_both_check = ttk.Checkbutton(
             auto_frame, text="Capture both cameras", variable=self.auto_both_var
         )
-        self.auto_both_check.grid(row=3, column=0, columnspan=2, sticky="w", **pad)
+        self.auto_both_check.grid(row=4, column=0, columnspan=2, sticky="w", **pad)
 
         # Exposure variation -- optional, off by default. When on, every
         # switch also steps the exposure through a start/step/end sweep
@@ -339,26 +395,26 @@ class App:
         self.auto_exp_check = ttk.Checkbutton(
             auto_frame, text="Vary exposure each switch", variable=self.auto_exp_var
         )
-        self.auto_exp_check.grid(row=4, column=0, columnspan=2, sticky="w", **pad)
+        self.auto_exp_check.grid(row=5, column=0, columnspan=2, sticky="w", **pad)
 
-        ttk.Label(auto_frame, text="Exposure start (us):").grid(row=5, column=0, sticky="e")
+        ttk.Label(auto_frame, text="Exposure start (us):").grid(row=6, column=0, sticky="e")
         self.auto_exp_start_entry = ttk.Entry(auto_frame, width=8)
-        self.auto_exp_start_entry.grid(row=5, column=1, sticky="w")
+        self.auto_exp_start_entry.grid(row=6, column=1, sticky="w")
 
-        ttk.Label(auto_frame, text="Exposure step (us):").grid(row=6, column=0, sticky="e")
+        ttk.Label(auto_frame, text="Exposure step (us):").grid(row=7, column=0, sticky="e")
         self.auto_exp_step_entry = ttk.Entry(auto_frame, width=8)
-        self.auto_exp_step_entry.grid(row=6, column=1, sticky="w")
+        self.auto_exp_step_entry.grid(row=7, column=1, sticky="w")
 
-        ttk.Label(auto_frame, text="Exposure end (us):").grid(row=7, column=0, sticky="e")
+        ttk.Label(auto_frame, text="Exposure end (us):").grid(row=8, column=0, sticky="e")
         self.auto_exp_end_entry = ttk.Entry(auto_frame, width=8)
-        self.auto_exp_end_entry.grid(row=7, column=1, sticky="w")
+        self.auto_exp_end_entry.grid(row=8, column=1, sticky="w")
 
         # Alternative to the start/step/end sweep above: an explicit,
         # hand-authored list of exposure values (one microsecond value per
         # line in a text file). When a list is loaded it takes precedence
         # over start/step/end -- see _auto_exposure_values().
         exp_file_btns = ttk.Frame(auto_frame)
-        exp_file_btns.grid(row=8, column=0, columnspan=2, sticky="ew", **pad)
+        exp_file_btns.grid(row=9, column=0, columnspan=2, sticky="ew", **pad)
         self.load_exp_file_btn = ttk.Button(
             exp_file_btns, text="Load Exposure List...", command=self.load_exposure_list_dialog
         )
@@ -370,77 +426,268 @@ class App:
         self.auto_exp_file_label = ttk.Label(
             auto_frame, text="(no exposure list loaded)", foreground="gray40", wraplength=220, justify="left"
         )
-        self.auto_exp_file_label.grid(row=9, column=0, columnspan=2, sticky="w", **pad)
+        self.auto_exp_file_label.grid(row=10, column=0, columnspan=2, sticky="w", **pad)
 
         self.start_auto_btn = ttk.Button(
             auto_frame, text="Start Auto Cycle", command=self.start_auto_cycle
         )
-        self.start_auto_btn.grid(row=10, column=0, columnspan=2, sticky="ew", **pad)
+        self.start_auto_btn.grid(row=11, column=0, columnspan=2, sticky="ew", **pad)
         self.stop_auto_btn = ttk.Button(
             auto_frame, text="Stop Auto Cycle", command=self.stop_auto_cycle, state="disabled"
         )
-        self.stop_auto_btn.grid(row=11, column=0, columnspan=2, sticky="ew", **pad)
+        self.stop_auto_btn.grid(row=12, column=0, columnspan=2, sticky="ew", **pad)
 
         self.auto_status_label = ttk.Label(auto_frame, text="Not running")
-        self.auto_status_label.grid(row=12, column=0, columnspan=2, sticky="w", **pad)
+        self.auto_status_label.grid(row=13, column=0, columnspan=2, sticky="w", **pad)
 
         ttk.Label(
             auto_frame,
             text="Needs SLM + (one camera,\nor both if checked) open first.",
             justify="left",
             foreground="gray40",
-        ).grid(row=13, column=0, columnspan=2, sticky="w", **pad)
+        ).grid(row=14, column=0, columnspan=2, sticky="w", **pad)
 
-        preview_frame = ttk.Frame(self.root)
-        preview_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", **pad)
+        # ---- Previews: three side-by-side columns separated by draggable
+        # dividers (mask | Blackfly | Basler). Each column stacks the
+        # capture preview over the live view. Drag a divider to give one
+        # column more room; its thumbnails grow to fill it.
+        self.preview_pw = ttk.PanedWindow(self.preview_section, orient="horizontal")
+        self.preview_pw.pack(fill="both", expand=True)
+        self._preview_cols = {}
+        for key in ("mask", "blackfly", "basler"):
+            col = ttk.Frame(self.preview_pw)
+            self.preview_pw.add(col, weight=1)
+            col.bind("<Configure>", self._on_preview_col_configure)
+            self._preview_cols[key] = col
 
-        mask_prev_frame = ttk.LabelFrame(preview_frame, text="Current mask")
-        mask_prev_frame.grid(row=0, column=0, **pad)
         # NOTE: a tk.Label's width/height are measured in *characters and
         # text lines*, not pixels, until an actual image is assigned to
-        # it -- setting width=220, height=150 here meant "220 characters
-        # by 150 text lines" (enormous) until the first mask/capture was
-        # shown, which was blowing up the whole window's layout. Give it
-        # a real blank placeholder image up front instead, so it's
-        # always in pixel-sized "image mode" from the start.
-        blank = np.zeros((THUMB_H, THUMB_W), dtype=np.uint8)
-        self._blank_photo = array_to_photoimage(blank, THUMB_W, THUMB_H)
+        # it -- so each preview label starts with a real blank image
+        # instead, which keeps it in pixel-sized "image mode" from the start.
+        for key, (bw, bh) in self.preview_sizes.items():
+            self._blank_photos[key] = array_to_photoimage(
+                np.zeros((bh, bw), dtype=np.uint8), bw, bh
+            )
 
+        mask_prev_frame = ttk.LabelFrame(self._preview_cols["mask"], text="Current mask")
+        mask_prev_frame.pack(fill="both", expand=True, **pad)
         self.mask_preview_label = tk.Label(
-            mask_prev_frame, image=self._blank_photo, background="gray20"
+            mask_prev_frame, image=self._blank_photos["mask"], background="gray20"
         )
-        self.mask_preview_label.pack()
+        self.mask_preview_label.pack(expand=True)
 
-        # Two capture previews (not one shared "last capture") -- added
-        # 2026-09-24 alongside Capture Both, so a dual capture shows both
-        # results at once instead of one overwriting the other.
-        blackfly_prev_frame = ttk.LabelFrame(preview_frame, text="Blackfly capture")
-        blackfly_prev_frame.grid(row=0, column=1, **pad)
-        self.blackfly_preview_label = tk.Label(
-            blackfly_prev_frame, image=self._blank_photo, background="gray20"
+        # Live view toggles sit under the mask preview. The live pictures
+        # are display only -- contrast stretch / colour conversion never
+        # touches saved files.
+        live_ctl_frame = ttk.LabelFrame(self._preview_cols["mask"], text="Live view")
+        live_ctl_frame.pack(fill="x", **pad)
+        self._live_ctl_frame = live_ctl_frame
+        self.live_vars = {
+            "blackfly": tk.BooleanVar(value=False),
+            "basler": tk.BooleanVar(value=False),
+        }
+        for choice, text in (("blackfly", "Blackfly live"), ("basler", "Basler live")):
+            ttk.Checkbutton(
+                live_ctl_frame,
+                text=text,
+                variable=self.live_vars[choice],
+                command=lambda c=choice: self._on_live_toggle(c),
+            ).pack(anchor="w")
+        ttk.Label(live_ctl_frame, text="Camera must be open.", foreground="gray40").pack(anchor="w")
+        ttk.Label(live_ctl_frame, text="Auto-contrast, display only.", foreground="gray40").pack(
+            anchor="w"
         )
-        self.blackfly_preview_label.pack()
+
+        # Two capture previews (not one shared "last capture") so a dual
+        # capture shows both results at once.
+        blackfly_prev_frame = ttk.LabelFrame(self._preview_cols["blackfly"], text="Blackfly capture")
+        blackfly_prev_frame.pack(fill="both", expand=True, **pad)
+        self.blackfly_preview_label = tk.Label(
+            blackfly_prev_frame, image=self._blank_photos["blackfly"], background="gray20"
+        )
+        self.blackfly_preview_label.pack(expand=True)
         self.blackfly_path_label = ttk.Label(blackfly_prev_frame, text="No capture yet")
         self.blackfly_path_label.pack(anchor="w")
 
-        basler_prev_frame = ttk.LabelFrame(preview_frame, text="Basler capture")
-        basler_prev_frame.grid(row=0, column=2, **pad)
-        self.basler_preview_label = tk.Label(
-            basler_prev_frame, image=self._blank_photo, background="gray20"
+        blackfly_live_frame = ttk.LabelFrame(self._preview_cols["blackfly"], text="Blackfly live")
+        blackfly_live_frame.pack(fill="both", expand=True, **pad)
+        self.blackfly_live_label = tk.Label(
+            blackfly_live_frame, image=self._blank_photos["blackfly"], background="gray20"
         )
-        self.basler_preview_label.pack()
+        self.blackfly_live_label.pack(expand=True)
+
+        basler_prev_frame = ttk.LabelFrame(self._preview_cols["basler"], text="Basler capture")
+        basler_prev_frame.pack(fill="both", expand=True, **pad)
+        self.basler_preview_label = tk.Label(
+            basler_prev_frame, image=self._blank_photos["basler"], background="gray20"
+        )
+        self.basler_preview_label.pack(expand=True)
         self.basler_path_label = ttk.Label(basler_prev_frame, text="No capture yet")
         self.basler_path_label.pack(anchor="w")
 
-        log_frame = ttk.LabelFrame(self.root, text="Log")
-        log_frame.grid(row=2, column=0, columnspan=3, sticky="nsew", **pad)
+        basler_live_frame = ttk.LabelFrame(self._preview_cols["basler"], text="Basler live")
+        basler_live_frame.pack(fill="both", expand=True, **pad)
+        self.basler_live_label = tk.Label(
+            basler_live_frame, image=self._blank_photos["basler"], background="gray20"
+        )
+        self.basler_live_label.pack(expand=True)
+
+        log_wrap = ttk.Frame(self.log_section)
+        log_wrap.pack(fill="both", expand=True, **pad)
+        log_frame = ttk.LabelFrame(log_wrap, text="Log")
+        self._attach_collapsible(log_wrap, log_frame, "Log", self._reflow_log_pane)
         self.log_text = ScrolledText(log_frame, width=80, height=6, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
-        self.root.grid_rowconfigure(2, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=1)
-        self.root.grid_columnconfigure(2, weight=1)
+        for col in range(3):
+            self.top_section.grid_columnconfigure(col, weight=1)
+
+    # --------------------------------------------- resizable layout --
+
+    def _build_panes(self):
+        """The window is three stacked sections separated by draggable
+        dividers: the control panels on top, the previews in the middle,
+        the log at the bottom. Drag a divider to resize; the Camera / SLM /
+        Auto Cycle / Log headers collapse their panel."""
+        # Always-visible toolbar holding the collapse/expand buttons. It
+        # lives OUTSIDE the paned window so no pane sizing can ever hide it.
+        self.toolbar = ttk.Frame(self.root)
+        self.toolbar.pack(side="top", fill="x", padx=6, pady=(4, 0))
+        ttk.Label(self.toolbar, text="Show / hide panels:").pack(side="left", padx=(0, 6))
+        self.main_pw = ttk.PanedWindow(self.root, orient="vertical")
+        self.main_pw.pack(side="top", fill="both", expand=True)
+        self.top_section = ttk.Frame(self.main_pw)
+        self.preview_section = ttk.Frame(self.main_pw)
+        self.log_section = ttk.Frame(self.main_pw)
+        self.main_pw.add(self.top_section, weight=0)
+        self.main_pw.add(self.preview_section, weight=3)
+        self.main_pw.add(self.log_section, weight=1)
+
+    def _attach_collapsible(self, wrapper, content, title, on_toggle, column=None):
+        """Put a clickable header above `content` (a LabelFrame already
+        created inside `wrapper`); clicking it hides/shows the content.
+        `column`: grid column of `wrapper` in the top section -- a
+        collapsed panel gives up its share of the width."""
+        wrapper.grid_rowconfigure(0, weight=1)
+        wrapper.grid_columnconfigure(0, weight=1)
+        is_open = {"v": True}
+        button = ttk.Button(self.toolbar, text=f"▾ {title}")
+
+        def toggle():
+            if is_open["v"]:
+                content.grid_remove()
+                button.configure(text=f"▸ {title}")
+                is_open["v"] = False
+            else:
+                content.grid()
+                button.configure(text=f"▾ {title}")
+                is_open["v"] = True
+            if column is not None:
+                self.top_section.grid_columnconfigure(column, weight=1 if is_open["v"] else 0)
+            on_toggle()
+
+        button.configure(command=toggle)
+        button.pack(side="left", padx=2)
+        # A Tk frame with NO managed children keeps its old requested size,
+        # so a collapsed panel would still hold its space. This 1px spacer
+        # is always gridded, which lets the wrapper shrink to ~nothing.
+        ttk.Frame(wrapper, width=1, height=1).grid(row=1, column=0)
+        content.grid(row=0, column=0, sticky="nsew")
+
+    def _reflow_top_pane(self):
+        # Let the geometry settle, then fit the top section to its panels,
+        # so collapsing them hands the space to the previews (and
+        # re-opening takes it back).
+        self.root.after(40, self._set_top_sash)
+
+    def _set_top_sash(self):
+        try:
+            self.root.update_idletasks()
+            self.main_pw.sashpos(0, self.top_section.winfo_reqheight())
+        except tk.TclError:
+            pass
+
+    def _reflow_log_pane(self):
+        self.root.after(40, self._set_log_sash)
+
+    def _set_log_sash(self):
+        try:
+            self.root.update_idletasks()
+            total = self.main_pw.winfo_height()
+            self.main_pw.sashpos(1, total - self.log_section.winfo_reqheight())
+        except tk.TclError:
+            pass
+
+    def _on_preview_col_configure(self, _event=None):
+        # Resize the previews once the user stops dragging a divider.
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(150, self.apply_preview_size)
+
+    def apply_preview_size(self, force: bool = False):
+        """Size each column's thumbnails to the room its pane has: wider
+        pane -> wider pictures, taller pane -> taller pictures (up to the
+        source image's own size -- they're never blown up past that)."""
+        self._resize_after_id = None
+        changed = set()
+        for key, col in self._preview_cols.items():
+            cw, ch = col.winfo_width(), col.winfo_height()
+            if cw < 60 or ch < 60:  # not laid out yet
+                continue
+            if key == "mask":
+                # title + padding above the picture, live toggles box below
+                avail_h = ch - 60 - (self._live_ctl_frame.winfo_reqheight() + 24)
+            else:
+                # capture and live stacked: two titles, the path line, padding
+                avail_h = (ch - 140) // 2
+            w = max(PREVIEW_MIN_W, min(PREVIEW_MAX_W, cw - 30))
+            h = max(PREVIEW_MIN_H, min(PREVIEW_MAX_H, avail_h))
+            old_w, old_h = self.preview_sizes[key]
+            if force or abs(w - old_w) >= 12 or abs(h - old_h) >= 12:
+                self.preview_sizes[key] = (w, h)
+                changed.add(key)
+        if changed:
+            self._render_previews(changed)
+
+    def _render_previews(self, keys):
+        """Redraw the previews in the given columns at their current size,
+        from what each was showing (the mask by index, captures from their
+        saved files)."""
+        for key in keys:
+            w, h = self.preview_sizes[key]
+            self._blank_photos[key] = array_to_photoimage(np.zeros((h, w), dtype=np.uint8), w, h)
+
+        if "mask" in keys:
+            w, h = self.preview_sizes["mask"]
+            idx = self._current_mask_index
+            if idx is not None and idx < len(self.masks):
+                self._mask_thumb_photo = array_to_photoimage(self.masks[idx], w, h)
+                self.mask_preview_label.configure(image=self._mask_thumb_photo)
+            else:
+                self.mask_preview_label.configure(image=self._blank_photos["mask"])
+
+        for choice, label in (
+            ("blackfly", self.blackfly_preview_label),
+            ("basler", self.basler_preview_label),
+        ):
+            if choice not in keys:
+                continue
+            w, h = self.preview_sizes[choice]
+            path = self._last_capture_path[choice]
+            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED) if path else None
+            if img is None:
+                label.configure(image=self._blank_photos[choice])
+            else:
+                photo = array_to_photoimage(img, w, h)
+                if choice == "blackfly":
+                    self._blackfly_thumb_photo = photo
+                else:
+                    self._basler_thumb_photo = photo
+                label.configure(image=photo)
+            # A running live view repaints itself within a poll or two; an
+            # idle one just needs its placeholder swapped to the new size.
+            if self._live_photos[choice] is None:
+                self._live_label(choice).configure(image=self._blank_photos[choice])
 
     def log(self, msg: str):
         ts = time.strftime("%H:%M:%S")
@@ -488,6 +735,7 @@ class App:
         cam = self.cams.get(choice)
         if cam is None:
             return
+        self._stop_live(choice, reset_checkbox=True)
         try:
             cam.stop()
             cam.close()
@@ -679,7 +927,8 @@ class App:
             self.log(f"Saved {saved}, but couldn't reload it here for the preview.")
             return saved
 
-        photo = array_to_photoimage(img, THUMB_W, THUMB_H)
+        photo = array_to_photoimage(img, *self.preview_sizes[choice])
+        self._last_capture_path[choice] = saved
         if choice == "blackfly":
             self._blackfly_thumb_photo = photo
             self.blackfly_preview_label.configure(image=photo)
@@ -689,6 +938,80 @@ class App:
             self.basler_preview_label.configure(image=photo)
             self.basler_path_label.configure(text=str(saved))
         return saved
+
+    # -------------------------------------------------------- live view --
+
+    def _live_label(self, choice: str):
+        return self.blackfly_live_label if choice == "blackfly" else self.basler_live_label
+
+    def _on_live_toggle(self, choice: str):
+        if not self.live_vars[choice].get():
+            self._stop_live(choice)
+            return
+        if self.cams[choice] is None:
+            self.log(f"Open the {choice} camera first, then turn its live view on.")
+            self.live_vars[choice].set(False)
+            return
+        if self._live_after_ids[choice] is None:
+            self._live_tick(choice)
+
+    def _stop_live(self, choice: str, reset_checkbox: bool = False):
+        after_id = self._live_after_ids.get(choice)
+        if after_id is not None:
+            self.root.after_cancel(after_id)
+            self._live_after_ids[choice] = None
+        if reset_checkbox:
+            self.live_vars[choice].set(False)
+        self._live_label(choice).configure(image=self._blank_photos[choice])
+        self._live_photos[choice] = None
+
+    @staticmethod
+    def _live_display_frame(choice: str, frame):
+        """Turn a raw live frame into something viewable. Display only --
+        saved captures are never processed like this."""
+        if choice == "blackfly":
+            # Raw 8-bit Bayer mosaic -> colour.
+            return cv2.cvtColor(frame, LIVE_BAYER_TO_BGR)
+        # Basler: raw 0-4095 values are far too dark to see as-is, so
+        # stretch each frame between its 1st and 99.5th percentile.
+        lo, hi = np.percentile(frame, (1, 99.5))
+        if hi <= lo:
+            hi = lo + 1
+        out = (frame.astype(np.float32) - lo) * (255.0 / (hi - lo))
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _live_tick(self, choice: str):
+        """One live-view poll: grab the newest frame if one has arrived
+        (without waiting long), show it, and schedule the next poll. Runs
+        on the Tk thread like everything else here, so it can never overlap
+        a capture or an exposure change."""
+        self._live_after_ids[choice] = None
+        cam = self.cams.get(choice)
+        if cam is None or not self.live_vars[choice].get():
+            self._stop_live(choice, reset_checkbox=True)
+            return
+        try:
+            frame = cam.grab_preview(
+                timeout_ms=LIVE_GRAB_TIMEOUT_MS,
+                downsample=(
+                    max(2, min(LIVE_BASLER_DOWNSAMPLE, BASLER_SENSOR_W // self.preview_sizes["basler"][0]))
+                    if choice == "basler"
+                    else 1
+                ),
+            )
+            if frame is not None:
+                photo = array_to_photoimage(
+                    self._live_display_frame(choice, frame), *self.preview_sizes[choice]
+                )
+                self._live_photos[choice] = photo
+                self._live_label(choice).configure(image=photo)
+        except (CameraError, cv2.error) as e:
+            self.log(f"Live view for {choice} stopped: {e}")
+            self._stop_live(choice, reset_checkbox=True)
+            return
+        self._live_after_ids[choice] = self.root.after(
+            LIVE_POLL_MS, lambda c=choice: self._live_tick(c)
+        )
 
     # ------------------------------------------------------- SLM actions --
 
@@ -736,7 +1059,10 @@ class App:
 
         name = self.mask_names[index] if index < len(self.mask_names) else f"Mask {index}"
         self.log(f"Showing mask {index} ({name}).")
-        self._mask_thumb_photo = array_to_photoimage(self.masks[index], THUMB_W, THUMB_H)
+        self._current_mask_index = index
+        self._mask_thumb_photo = array_to_photoimage(
+            self.masks[index], *self.preview_sizes["mask"]
+        )
         self.mask_preview_label.configure(image=self._mask_thumb_photo)
 
         # Same stale-frame race as set_exposure() (see _flush_stale_frame's
@@ -1035,7 +1361,27 @@ class App:
                 self.log("Exposure start/step/end must be numbers, in microseconds.")
                 return
 
+        # Passes: blank/0 = run until Stop. Otherwise stop after `passes`
+        # full passes, where one pass is max(masks in loop, exposure values)
+        # steps -- so every mask AND every exposure value gets used once.
+        ticks_limit = None
+        passes = 0
+        passes_text = self.auto_passes_entry.get().strip()
+        if passes_text:
+            try:
+                passes = int(passes_text)
+                if passes < 0:
+                    raise ValueError
+            except ValueError:
+                self.log("Passes must be a whole number (blank or 0 = keep going until stopped).")
+                return
+            if passes > 0:
+                per_pass = max(len(indices), len(exp_values) if exp_values else 0)
+                ticks_limit = passes * per_pass
+
         self._auto_running = True
+        self._auto_ticks_done = 0
+        self._auto_ticks_limit = ticks_limit
         self._auto_interval_ms = interval_ms
         self._auto_settle_ms = settle_ms
         self._auto_index = -1  # first tick's +1 lands on 0, i.e. indices[0]
@@ -1052,6 +1398,7 @@ class App:
         self.remove_folder_btn.configure(state="disabled")
         self.refresh_btn.configure(state="disabled")
         self.auto_exp_check.configure(state="disabled")
+        self.auto_passes_entry.configure(state="disabled")
         self.auto_exp_start_entry.configure(state="disabled")
         self.auto_exp_step_entry.configure(state="disabled")
         self.auto_exp_end_entry.configure(state="disabled")
@@ -1061,10 +1408,13 @@ class App:
         capture_desc = "both cameras" if both else f"the {self.cam_choice.get()} camera"
         set_desc = self.auto_set_var.get()
         exp_desc = f", exposure over {len(exp_values)} step(s)" if exp_values else ""
+        stop_desc = (
+            f" Stops after {passes} pass(es) ({ticks_limit} step(s))." if ticks_limit else ""
+        )
         self.log(
             f"Auto cycle started: switch masks (set '{set_desc}', "
             f"{len(indices)} mask(s)) every {interval_ms}ms, capture from "
-            f"{capture_desc} {settle_ms}ms after each switch{exp_desc}."
+            f"{capture_desc} {settle_ms}ms after each switch{exp_desc}.{stop_desc}"
         )
         self._auto_cycle_tick()
 
@@ -1083,6 +1433,7 @@ class App:
         self.remove_folder_btn.configure(state="normal")
         self.refresh_btn.configure(state="normal")
         self.auto_exp_check.configure(state="normal")
+        self.auto_passes_entry.configure(state="normal")
         if self._auto_exp_file_values is None:
             self.auto_exp_start_entry.configure(state="normal")
             self.auto_exp_step_entry.configure(state="normal")
@@ -1105,6 +1456,10 @@ class App:
             self.stop_auto_cycle()
             return
         self._auto_index = (self._auto_index + 1) % len(indices)
+        if self._auto_ticks_limit:
+            self.auto_status_label.configure(
+                text=f"Running: step {self._auto_ticks_done + 1} of {self._auto_ticks_limit}"
+            )
         self.show_mask(indices[self._auto_index])  # also flushes one stale camera frame
 
         if self._auto_exp_values:
@@ -1249,12 +1604,21 @@ class App:
             self.capture_both(extra=extra)
         else:
             self.capture(extra=extra)
+        self._auto_ticks_done += 1
+        if self._auto_ticks_limit and self._auto_ticks_done >= self._auto_ticks_limit:
+            done = self._auto_ticks_done
+            self.stop_auto_cycle()
+            self.log(f"Auto cycle finished: all {done} step(s) done.")
+            return
         remaining_ms = max(0, self._auto_interval_ms - self._auto_settle_ms)
         self._auto_after_id = self.root.after(remaining_ms, self._auto_cycle_tick)
 
     # ------------------------------------------------------------- exit --
 
     def on_close(self):
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+            self._resize_after_id = None
         if self._auto_running:
             self.stop_auto_cycle()
         if self.slm is not None:
@@ -1296,6 +1660,12 @@ def main():
     target_w = min(max(req_w, int(screen_w * 0.55)), screen_w - 100)
     target_h = min(max(req_h, int(screen_h * 0.70)), screen_h - 100)
     root.geometry(f"{target_w}x{target_h}")
+    root.minsize(700, 420)
+    root.update()
+    app._set_top_sash()
+    app._set_log_sash()
+    root.update()
+    app.apply_preview_size(force=True)
     root.mainloop()
 
 
