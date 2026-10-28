@@ -16,7 +16,10 @@ Setup (one-time, on the machine the camera is physically connected to):
 Capture policy (set after the 2026-09 meeting):
     Frames are saved RAW -- the native Bayer mosaic straight off the
     sensor, with on-camera gamma correction and auto white balance both
-    turned off. There is no demosaic/color-conversion step in capture()
+    turned off, and the red/blue white-balance ratios set to 1.0 (neutral;
+    added 2026-10-28 -- switching auto white balance off only freezes them).
+    Run check_blackfly_raw.py with the camera connected to read the
+    settings back from the camera. There is no demosaic/color-conversion step in capture()
     on purpose: converting to a viewable color image is exactly the kind
     of processing this policy is meant to avoid. Frames are still written
     out as .png (PNG happily stores a single-channel 8-bit array; it just
@@ -179,6 +182,12 @@ class BlackflyCamera(Camera):
         ):
             self._cam.BalanceWhiteAuto.SetValue(PySpin.BalanceWhiteAuto_Off)
 
+        # Turning auto white balance off only FREEZES the red/blue balance ratios at
+        # whatever they last were (e.g. from an earlier auto run or SpinView); it does
+        # not reset them. Set both to 1.0 (neutral) so no colour gain is applied.
+        # Added 2026-10-28. Check the result with raw_settings() / check_blackfly_raw.py.
+        self.balance_ratio_note = self._set_neutral_balance()
+
         if PySpin.IsAvailable(self._cam.PixelFormat) and PySpin.IsWritable(self._cam.PixelFormat):
             # Native Bayer mosaic, undemosaiced -- the rawest form the
             # sensor can hand back. Must be set before BeginAcquisition().
@@ -223,6 +232,60 @@ class BlackflyCamera(Camera):
         self._cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
         self._cam.ExposureTime.SetValue(exposure_us)
         self.exposure_us = exposure_us
+
+    def _set_neutral_balance(self) -> str:
+        """Set BalanceRatio to 1.0 for Red and Blue. Never raises: returns a note
+        saying what happened, so a camera without these nodes still opens."""
+        try:
+            sel_node, ratio_node = self._cam.BalanceRatioSelector, self._cam.BalanceRatio
+            if not (PySpin.IsAvailable(sel_node) and PySpin.IsWritable(sel_node)):
+                return "BalanceRatioSelector not available - ratios left as they were"
+            done = []
+            for name in ("Red", "Blue"):
+                sel_node.SetValue(getattr(PySpin, f"BalanceRatioSelector_{name}"))
+                if PySpin.IsWritable(ratio_node):
+                    ratio_node.SetValue(1.0)
+                    done.append(name)
+            return f"BalanceRatio set to 1.0 for {', '.join(done) or 'none'}"
+        except Exception as e:  # noqa: BLE001 - keep open() working on any firmware
+            return f"could not set BalanceRatio ({e})"
+
+    def raw_settings(self) -> dict:
+        """Read back the camera settings that decide whether frames are raw:
+        pixel format, gamma, white balance (auto + both ratios), ISP and ADC depth.
+        Values that this camera doesn't expose come back as 'n/a'."""
+        if not self._is_open:
+            raise CameraError("Camera is not open. Call open() first.")
+        cam = self._cam
+
+        def enum(node):
+            try:
+                return node.GetCurrentEntry().GetSymbolic()
+            except Exception:  # noqa: BLE001
+                return "n/a"
+
+        def value(node):
+            try:
+                return node.GetValue()
+            except Exception:  # noqa: BLE001
+                return "n/a"
+
+        out = {
+            "PixelFormat": enum(cam.PixelFormat),
+            "GammaEnable": value(cam.GammaEnable),
+            "BalanceWhiteAuto": enum(cam.BalanceWhiteAuto),
+        }
+        for name in ("Red", "Blue"):
+            try:
+                cam.BalanceRatioSelector.SetValue(getattr(PySpin, f"BalanceRatioSelector_{name}"))
+                out[f"BalanceRatio_{name}"] = cam.BalanceRatio.GetValue()
+            except Exception:  # noqa: BLE001
+                out[f"BalanceRatio_{name}"] = "n/a"
+        for key in ("IspEnable", "AdcBitDepth", "BlackLevel", "ExposureAuto", "GainAuto", "Gain"):
+            node = getattr(cam, key, None)
+            out[key] = "n/a" if node is None else (value(node) if key in ("IspEnable", "BlackLevel", "Gain") else enum(node))
+        out["note"] = getattr(self, "balance_ratio_note", "")
+        return out
 
     def get_exposure_time(self) -> float:
         """Return the camera's current exposure time, in microseconds.

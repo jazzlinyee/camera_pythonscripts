@@ -37,6 +37,8 @@ def make_fake_pyspin():
     fake.GainAuto_Off = "GainAuto_Off"
     fake.BalanceWhiteAuto_Off = "BalanceWhiteAuto_Off"
     fake.PixelFormat_BayerRG8 = "PixelFormat_BayerRG8"
+    fake.BalanceRatioSelector_Red = "BalanceRatioSelector_Red"
+    fake.BalanceRatioSelector_Blue = "BalanceRatioSelector_Blue"
 
     fake.IsWritable.return_value = True
     fake.IsAvailable.return_value = True
@@ -108,6 +110,35 @@ class BlackflyCameraTests(unittest.TestCase):
         self.fake_cam.PixelFormat.SetValue.assert_called_once_with(
             "PixelFormat_BayerRG8"
         )
+
+    def test_configure_sets_white_balance_ratios_to_one(self):
+        # Added 2026-10-28: auto white balance off only freezes the ratios,
+        # so both are set to a neutral 1.0 explicitly.
+        cam = self._open_camera()
+        self.assertEqual(
+            [c.args[0] for c in self.fake_cam.BalanceRatioSelector.SetValue.call_args_list],
+            ["BalanceRatioSelector_Red", "BalanceRatioSelector_Blue"],
+        )
+        self.assertEqual(
+            [c.args[0] for c in self.fake_cam.BalanceRatio.SetValue.call_args_list], [1.0, 1.0]
+        )
+        self.assertIn("1.0 for Red, Blue", cam.balance_ratio_note)
+
+    def test_open_still_works_if_balance_ratio_cannot_be_set(self):
+        self.fake_cam.BalanceRatioSelector.SetValue.side_effect = RuntimeError("no such node")
+        cam = self._open_camera()
+        self.assertIn("could not set BalanceRatio", cam.balance_ratio_note)
+        self.fake_cam.PixelFormat.SetValue.assert_called_once_with("PixelFormat_BayerRG8")
+
+    def test_raw_settings_reads_back_camera_values(self):
+        cam = self._open_camera()
+        self.fake_cam.PixelFormat.GetCurrentEntry.return_value.GetSymbolic.return_value = "BayerRG8"
+        self.fake_cam.GammaEnable.GetValue.return_value = False
+        self.fake_cam.BalanceRatio.GetValue.return_value = 1.0
+        s = cam.raw_settings()
+        self.assertEqual(s["PixelFormat"], "BayerRG8")
+        self.assertIs(s["GammaEnable"], False)
+        self.assertEqual((s["BalanceRatio_Red"], s["BalanceRatio_Blue"]), (1.0, 1.0))
 
     def test_configure_sets_exposure_and_gain_when_given(self):
         self._open_camera(exposure_us=8000, gain_db=3.5)

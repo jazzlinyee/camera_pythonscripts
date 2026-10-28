@@ -115,6 +115,11 @@ from preview_utils import array_to_photoimage
 from slm_display import SLMDisplay, SLMError
 from test_on_hardware_slm import HEIGHT, WIDTH, make_test_masks
 
+# The SLM opens showing all-white (added 2026-10-28). White is an extra mask after the
+# loaded ones, so the mask list and its numbering are unchanged. Other code (e.g. the
+# pipeline) can check this flag instead of adding its own white mask.
+SLM_OPENS_WHITE = True
+
 OUTPUT_DIR = Path("test_captures")
 # Characters that can't safely appear in a file name on macOS/Windows/Linux --
 # replaced with "_" when cleaning a user-typed capture name.
@@ -663,6 +668,10 @@ class App:
             if idx is not None and idx < len(self.masks):
                 self._mask_thumb_photo = array_to_photoimage(self.masks[idx], w, h)
                 self.mask_preview_label.configure(image=self._mask_thumb_photo)
+            elif getattr(self, "_showing_white", False) and self.slm is not None:
+                white = np.full((h, w), 255, dtype=np.uint8)
+                self._mask_thumb_photo = array_to_photoimage(white, w, h)
+                self.mask_preview_label.configure(image=self._mask_thumb_photo)
             else:
                 self.mask_preview_label.configure(image=self._blank_photos["mask"])
 
@@ -832,7 +841,11 @@ class App:
             return
         self.save_dir = Path(folder)
         self.save_dir_label.configure(text=str(self.save_dir))
-        self.log(f"Photos will now be saved to {self.save_dir}")
+        # Numbering starts again for every folder (2026-10-28): an empty folder gets
+        # blackfly_000 / basler_000; a folder with photos continues after its last
+        # number (_next_capture_path skips names already on disk).
+        self.shots = {k: 0 for k in self.shots}
+        self.log(f"Photos will now be saved to {self.save_dir} (numbering restarts for this folder)")
 
     @staticmethod
     def _clean_filename(raw: str) -> str:
@@ -1019,11 +1032,11 @@ class App:
         if self.slm is not None:
             self.log("SLM already open.")
             return
-        if not self.masks:
-            self.log("No masks loaded -- add a folder first.")
-            return
+        # Opens on all-white (2026-10-28). White goes after the loaded masks, so
+        # show_mask(i) still shows the i-th loaded mask. Works with no masks loaded too.
+        white = np.full((HEIGHT, WIDTH), 255, dtype=np.uint8)
         try:
-            self.slm = SLMDisplay(self.masks, mirrored=self.mirrored, master=self.root)
+            self.slm = SLMDisplay(list(self.masks) + [white], mirrored=self.mirrored, master=self.root)
             self.slm.open()
         except SLMError as e:
             self.log(f"Failed to open SLM display: {e}")
@@ -1033,7 +1046,25 @@ class App:
         self.log("SLM display opened -- check it landed on the SLM's screen.")
         self.open_slm_btn.configure(state="disabled")
         self.close_slm_btn.configure(state="normal")
-        self.show_mask(0)
+        self.show_white()
+
+    def show_white(self):
+        """Show all-white on the SLM (the default when it opens)."""
+        if self.slm is None:
+            self.log("Open the SLM first.")
+            return
+        white = np.full((HEIGHT, WIDTH), 255, dtype=np.uint8)
+        try:
+            self.slm.set_masks(list(self.masks) + [white])
+            self.slm.show_mask(len(self.masks))
+        except SLMError as e:
+            self.log(f"Could not show white: {e}")
+            return
+        self.log("Showing white (SLM default).")
+        self._current_mask_index = None
+        self._showing_white = True
+        self._mask_thumb_photo = array_to_photoimage(white, *self.preview_sizes["mask"])
+        self.mask_preview_label.configure(image=self._mask_thumb_photo)
 
     def close_slm(self):
         if self.slm is None:
@@ -1060,6 +1091,7 @@ class App:
         name = self.mask_names[index] if index < len(self.mask_names) else f"Mask {index}"
         self.log(f"Showing mask {index} ({name}).")
         self._current_mask_index = index
+        self._showing_white = False
         self._mask_thumb_photo = array_to_photoimage(
             self.masks[index], *self.preview_sizes["mask"]
         )
@@ -1209,7 +1241,9 @@ class App:
         self._refresh_folder_choices()
 
         if self.slm is not None:
-            if not self.masks:
+            if getattr(self, "_showing_white", False):
+                self.show_white()          # keep white on screen; mask numbering updated behind it
+            elif not self.masks:
                 self.log("No valid masks found across the registered folders -- SLM display left as-is.")
             else:
                 try:

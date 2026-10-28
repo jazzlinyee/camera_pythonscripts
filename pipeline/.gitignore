@@ -1,0 +1,7 @@
+sessions/
+labgui_state/
+export_*/
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
