@@ -90,6 +90,36 @@ def scan_plan(session):
     return rows
 
 
+# Basler TIFFs written by the pipeline (2026-10-30): raw 12-bit x 16 ("MSB-aligned", 0-65520),
+# like the camera GUI saves, so they look normal in image viewers. Every reader divides by the
+# scale recorded with the data (manifest.json / position.json / check/scale.json), so results
+# stay in raw 12-bit units. Data saved before has no record -> scale 1.
+PIXEL_SCALE = 16
+
+
+def read_basler(path, scale=1):
+    """A pipeline Basler TIFF as float32 raw 12-bit values."""
+    im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if im is None:
+        raise StageError(f"Could not read {path}")
+    return im.astype(np.float32) / float(scale or 1)
+
+
+def scene_scale(sd):
+    p = Path(sd) / "manifest.json"
+    return json.loads(p.read_text()).get("pixel_scale", 1) if p.is_file() else 1
+
+
+def check_scale(chk):
+    p = Path(chk) / "scale.json"
+    return json.loads(p.read_text()).get("pixel_scale", 1) if p.is_file() else 1
+
+
+def bright_fraction(raw):
+    """How full the sensor is in the bright parts (99.9th percentile / 4095)."""
+    return float(np.percentile(np.asarray(raw)[::4, ::4], 99.9)) / 4095
+
+
 def _black():
     return np.zeros((1080, 1920), np.uint8)
 
@@ -140,7 +170,7 @@ def _run_shots(rig, shots, ui, log):
         if shot["fmt"] == "png8":
             cv2.imwrite(str(out), raw12_to_png8(raw))
         else:
-            cv2.imwrite(str(out), raw.astype(np.uint16))
+            cv2.imwrite(str(out), (np.clip(raw, 0, 4095).astype(np.uint16) << 4))   # x16, see PIXEL_SCALE
         sat = saturation_fraction(raw)
         shot["saturated"] = sat
         if shot["save"].get("blackfly"):
@@ -148,8 +178,11 @@ def _run_shots(rig, shots, ui, log):
             if rgb is not None:
                 Path(shot["save"]["blackfly"]).parent.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(shot["save"]["blackfly"]), rgb)
+                # the same raw Bayer bytes as a headerless .raw (the lab's img_rgb.raw format)
+                np.ascontiguousarray(rgb).tofile(str(Path(shot["save"]["blackfly"]).with_suffix(".raw")))
         ui.progress(i, n, f"{out.name}" + (f"  ({sat:.1%} saturated!)" if sat > 0.001 else ""))
         shot["raw_stats"] = [int(raw.min()), float(raw.mean()), int(raw.max())]
+        shot["bright"] = bright_fraction(raw)
         g_i += 1
         if shot.get("label"):                     # one line per frame (calibration)
             done = time.time() - g_t0
@@ -233,6 +266,8 @@ def calibrate_capture(session, rig, ui, log=print, laser=None):
         (cap / folder / "patterns.json").write_text(json.dumps(
             {"incomplete": True, "started": _now(), "nm": nm, "exposure_us": exp, "flip_patterns_x": flip}, indent=2))
     run_shots(rig, shots, ui, log)
+    if any(s["save"]["basler"].parent.name == "check" for s in shots):
+        (cap / "check" / "scale.json").write_text(json.dumps({"pixel_scale": PIXEL_SCALE}))
     record = json.loads((cal / "capture.json").read_text()) if (cal / "capture.json").is_file() else {}
     per_laser = record.get("per_laser", {})
     for folder, nm, exp in lasers:          # record each laser separately (others are kept)
@@ -383,8 +418,9 @@ def calibrate_check(session, log=print):
     if not all(f.is_file() for f in files):
         raise StageError(f"Check frames missing in {chk}.")
     plan = scan_plan(session)
-    zero = cv2.imread(str(files[0]), cv2.IMREAD_UNCHANGED)
-    frames = {k: cv2.imread(str(chk / f"mask_{k:02d}.tiff"), cv2.IMREAD_UNCHANGED) for k in CHECK_MASKS}
+    sc = check_scale(chk)
+    zero = read_basler(files[0], sc)
+    frames = {k: read_basler(chk / f"mask_{k:02d}.tiff", sc) for k in CHECK_MASKS}
     masks = {k: _load_mask(plan[k]["mask"]) > 0 for k in CHECK_MASKS}
     laser = session.settings["calibration"]["check_laser"]
     nm = next(nm for f, nm, _ in session.settings["calibration"]["lasers"] if f == laser)
@@ -400,6 +436,8 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
     sd = session.scene_dir(scene)
     if (sd / "manifest.json").exists():
         raise StageError(f"Scene '{scene}' already exists in this session - pick a new name.")
+    if (sd / "positions").is_dir():
+        raise StageError(f"'{scene}' holds sparse positions - use another name for the full scan.")
     if not (session.settings["capture"]["zero_at_start"] or session.settings["capture"]["zero_at_end"]):
         raise StageError("At least one all-zero capture (start or end) is needed.")
     cap = sd / "captures"
@@ -435,8 +473,7 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
     t0 = time.time()
     run_shots(rig, shots, ui, log)
 
-    zeros = [cv2.imread(str(cap / n), cv2.IMREAD_UNCHANGED).astype(np.float32)
-             for n in ("zero_start.tiff", "zero_end.tiff") if (cap / n).is_file()]
+    zeros = [read_basler(cap / n) for n in ("zero_start.tiff", "zero_end.tiff") if (cap / n).is_file()]
     drift = None
     if len(zeros) == 2:
         drift = float(abs(zeros[0].mean() - zeros[1].mean()) / max(zeros[0].mean(), 1e-6))
@@ -447,7 +484,9 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
 
     manifest = {
         "scene": scene, "session": session.name, "captured": _now(), "seconds": round(time.time() - t0),
-        "exposure_us": exp, "settle_ms": s["settle_ms"], "pixel_values": "raw 12-bit (0-4095) in uint16 TIFF",
+        "exposure_us": exp, "settle_ms": s["settle_ms"], "pixel_scale": PIXEL_SCALE,
+        "pixel_values": "raw 12-bit x 16 (0-65520) in uint16 TIFF - divide by pixel_scale",
+        "bright_fraction": round(float(np.median([x["bright"] for x in shots[1:-1] or shots])), 3),
         "table": str(session.table), "table_md5": _md5(session.table) if session.table.is_file() else None,
         "zero_frames": [n for n in ("zero_start.tiff", "zero_end.tiff") if (cap / n).is_file()],
         "zero_drift": drift, "blackfly": bool(bf), "blackfly_settings": bf_settings,
@@ -458,15 +497,95 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
     (sd / "manifest.json").write_text(json.dumps(manifest, indent=2))
     if manifest["saturated_frames"]:
         log(f"WARNING: {len(manifest['saturated_frames'])} frames have saturated pixels - lower the exposure.")
+    log(f"Exposure {exp:.0f} us: bright parts reach {manifest['bright_fraction']:.0%} of full scale.")
+    if manifest["bright_fraction"] < 0.4:
+        log(f"WARNING: the frames are dark (bright parts at {manifest['bright_fraction']:.0%} of full scale) - "
+            f"a longer exposure would give less noise.")
     log(f"Scene saved in {sd}")
     return manifest
+
+
+# =============================================================== SPARSE CAPTURE (moving object)
+def default_sparse_mask(session):
+    """mask_00 of the scan masks (the single mask used for sparse measurements)."""
+    return session.lab_path("scan_masks") / "mask_00.png"
+
+
+def capture_position(session, rig, scene, ui, log=print, mask_path=None, use_blackfly=None):
+    """One position of a moving object: the sparse mask (with a Blackfly frame), then the
+    black mask (Basler only), at the same exposure, back to back. Saved in
+    scenes/<scene>/positions/pos_NN/: mask.tiff, zero.tiff (raw 12-bit), rgb.png + rgb.raw,
+    position.json. Returns the position record."""
+    sd = session.scene_dir(scene)
+    if (sd / "manifest.json").exists():
+        raise StageError(f"'{scene}' is a full-scan scene - use another name for the sparse positions.")
+    mask_path = Path(mask_path) if mask_path else default_sparse_mask(session)
+    mask = _load_mask(mask_path)
+    s = session.settings
+    exp = s["capture"]["exposure_us"]
+    bf = s["blackfly"]["enabled"] if use_blackfly is None else use_blackfly
+    done = sorted(p for p in (sd / "positions").glob("pos_*") if (p / "position.json").is_file()) \
+        if (sd / "positions").is_dir() else []
+    k = len(done) + 1
+    pd = sd / "positions" / f"pos_{k:02d}"
+    if pd.exists():
+        shutil.rmtree(pd)                    # a stopped attempt at this position: start it again
+    pd.mkdir(parents=True)
+    ui.main(lambda: rig.load_masks([mask, _black()]))
+    shots = [dict(mask_index=0, fmt="raw16", group="pos", exposure=exp,
+                  save={"basler": pd / "mask.tiff", "blackfly": (pd / "rgb.png") if bf else None}),
+             dict(mask_index=1, fmt="raw16", group="pos", exposure=exp, save={"basler": pd / "zero.tiff"})]
+    bf_settings = None
+    if bf and getattr(rig, "blackfly", None) is not None and hasattr(rig.blackfly, "raw_settings"):
+        try:
+            bf_settings = json.loads(json.dumps(rig.blackfly.raw_settings(), default=str))
+        except Exception as e:  # noqa
+            bf_settings = {"error": str(e)}
+    log(f"Position {k} of '{scene}': {mask_path.name} then black, {exp:.0f} us. Keep the object still.")
+    t0 = time.time()
+    run_shots(rig, shots, ui, log)
+    m = read_basler(pd / "mask.tiff", PIXEL_SCALE)
+    z = read_basler(pd / "zero.tiff", PIXEL_SCALE)
+    rec = {"position": k, "scene": scene, "session": session.name, "captured": _now(),
+           "seconds": round(time.time() - t0, 1), "exposure_us": exp, "settle_ms": s["settle_ms"],
+           "mask_file": str(mask_path), "pixel_scale": PIXEL_SCALE,
+           "pixel_values": "raw 12-bit x 16 (0-65520) in uint16 TIFF - divide by pixel_scale",
+           "mask_mean": float(m.mean()), "zero_mean": float(z.mean()), "bright_fraction": round(shots[0]["bright"], 3),
+           "saturated": {"mask.tiff": shots[0]["saturated"], "zero.tiff": shots[1]["saturated"]},
+           "blackfly": bool(bf), "blackfly_settings": bf_settings,
+           "table": str(session.table)}
+    (pd / "position.json").write_text(json.dumps(rec, indent=2))
+    if rec["zero_mean"] >= rec["mask_mean"]:
+        log("WARNING: the black frame is not darker than the mask frame - did the SLM change?")
+    if shots[0]["saturated"] > 0.001:
+        log(f"WARNING: {shots[0]['saturated']:.1%} of the mask frame is saturated - lower the exposure.")
+    log(f"Exposure {exp:.0f} us: bright parts reach {shots[0]['bright']:.0%} of full scale.")
+    if shots[0]["bright"] < 0.4:
+        log(f"WARNING: the mask frame is dark (bright parts at {shots[0]['bright']:.0%}) - consider a longer exposure.")
+    log(f"Position {k} saved in {pd} ({rec['seconds']} s). Move the object for the next position.")
+    return rec
+
+
+def export_positions(session, scene, log=print, background="none"):
+    """Sparse cube + RGB on SLM coordinates for every captured position of a scene, each with
+    its own black frame subtracted (export_sparse.py --positions). -> scenes/<scene>/sparse_export/"""
+    import export_sparse
+    sd = session.scene_dir(scene)
+    guide = session.cal_dir / "guide" / "guide_to_slm.npz"
+    if not guide.is_file():
+        raise StageError(f"No Blackfly -> SLM map at {guide} (run guide_calib.ipynb first).")
+    if not any((sd / "positions").glob("pos_*/mask.tiff")):
+        raise StageError(f"No captured positions in scene '{scene}'.")
+    return export_sparse.run([sd], session.name, guide, sd / "sparse_export", positions=True,
+                             background=background, log=log)
 
 
 # =============================================================== CUBE
 def scene_check(session, scene, log=print):
     sd = session.scene_dir(scene)
-    zero = cv2.imread(str(sd / "captures" / "zero.tiff"), cv2.IMREAD_UNCHANGED)
-    frames = {k: cv2.imread(str(sd / "captures" / f"scan_{k:02d}.tiff"), cv2.IMREAD_UNCHANGED) for k in CHECK_MASKS}
+    sc = scene_scale(sd)
+    zero = read_basler(sd / "captures" / "zero.tiff", sc)
+    frames = {k: read_basler(sd / "captures" / f"scan_{k:02d}.tiff", sc) for k in CHECK_MASKS}
     masks = {k: cv2.imread(str(sd / "masks" / f"mask_{k:02d}.png"), cv2.IMREAD_GRAYSCALE) > 0 for k in CHECK_MASKS}
     log("Orientation check (scene captures vs table):")
     res = orientation_check(session.table, zero, frames, masks, band_nm=550, log=log, strict_alignment=False)
@@ -487,6 +606,7 @@ def make_cube(session, scene, log=print, force=False, skip_existing=True):
         raise StageError("Orientation check failed, so the cube would be wrong: " + " ".join(res["problems"])
                          + " (Use --force to make it anyway.)")
 
+    sc = scene_scale(sd)
     code = session.lab_path("calibration_code")
     out = sd / "cubes"
     out.mkdir(parents=True, exist_ok=True)
@@ -508,7 +628,11 @@ def make_cube(session, scene, log=print, force=False, skip_existing=True):
                  Rule("output", r".*cube[^/]*\.npz", str(cube_path), 1)]
         t = time.time()
         quiet = []
-        ok = run_notebook(code / "meas2hyper.ipynb", rules, out, None, log=quiet.append)
+        code_rules = []
+        if sc != 1:          # x16 TIFFs: hand meas2hyper raw 12-bit values, as for every earlier cube
+            code_rules = [CodeRule("pixel scale", "g_measured = im_mask.astype(np.float32) - im_zero.astype(np.float32)",
+                                   f"g_measured = (im_mask.astype(np.float32) - im_zero.astype(np.float32)) / {float(sc)}", 1)]
+        ok = run_notebook(code / "meas2hyper.ipynb", rules, out, None, log=quiet.append, code_rules=code_rules)
         if ok and cube_path.is_file():
             done.append(cube_path)
             log(f"[{n}/{len(man['frames'])}] frame {k:02d}: ok ({time.time() - t:.0f}s)")
@@ -530,7 +654,7 @@ def make_cube(session, scene, log=print, force=False, skip_existing=True):
         import full_cube
         log("Making the fully sampled cube (cube_full.npz)…")
         src = full_cube.build(full_cube.scene_pairs(sd), zero, session.table, out=out / "cube_full.npz",
-                              qe_csv=qe, log=log)
+                              qe_csv=qe, log=log, scale=sc)
         info["full"] = {"calibrated": float((src == 2).mean()), "extended": float((src == 1).mean()),
                         "filled": float((src == 0).mean())}
     (out / "cube.json").write_text(json.dumps(info, indent=2))

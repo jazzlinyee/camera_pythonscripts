@@ -126,6 +126,7 @@ class App:
         self.rig = None
         self.busy = None              # description of the running job
         self.log_dest = "main"        # "cal" while a calibration job runs (output -> Calibrate tab panel)
+        self._scrollers = []          # (canvas, content, vertical scrollbar) of each scrollable tab
         self.proc = None              # running subprocess
         self.ui = GuiUI(self)
         self.live_on = False
@@ -136,6 +137,7 @@ class App:
         if session_name or names:
             self.load_session(session_name or names[-1])
         self.root.after(100, self._drain)
+        self.root.after(800, self._open_live_at_start)     # the livestream opens with the GUI
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ------------------------------------------------------------------ layout
@@ -176,6 +178,8 @@ class App:
         self._build_calibrate()
         self._build_capture()
         self._build_cube()
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(seq, self._tab_wheel, add="+")
         if self.lab is None:          # (with the camera GUI, _build_capture_lab binds this)
             self.nb.bind("<<NotebookTabChanged>>", self._on_tab, add="+")
 
@@ -264,10 +268,52 @@ class App:
         all_open = all(self._hw_is_open(k) for k, _ in self._HW)
         self.hw_all_btn.configure(state="disabled" if (self.busy or sim or all_open) else "normal")
         self._bf_refresh()
+        self._sync_cap_exposure()
         try:
             self.root.after(1000, self._hw_refresh)
         except tk.TclError:
             pass
+
+    # ---- Basler exposure box (Capture tab) <-> camera
+    def _basler_cam(self):
+        return self.lab.cams.get("basler") if self.lab is not None else None
+
+    def _sync_cap_exposure(self):
+        """Show the camera's current exposure in the Capture tab's box (unless you are typing in it)."""
+        cam = self._basler_cam()
+        if cam is None or self.busy or not hasattr(self, "cap_exp_entry"):
+            return
+        try:
+            if self.root.focus_get() is self.cap_exp_entry:
+                return
+            us = float(cam.get_exposure_time())
+        except Exception:  # noqa
+            return
+        if self.cap_exp.get() != f"{us:.0f}":
+            self.cap_exp.set(f"{us:.0f}")
+
+    def _apply_cap_exposure(self, quiet=False):
+        """Set the camera to the exposure typed in the Capture tab's box."""
+        cam = self._basler_cam()
+        if cam is None or self.busy:
+            return True
+        try:
+            us = float(self.cap_exp.get())
+        except ValueError:
+            if not quiet:
+                messagebox.showinfo("Exposure", "The Basler exposure must be a number (µs).")
+            return False
+        try:
+            if abs(float(cam.get_exposure_time()) - us) > 0.5:
+                cam.set_exposure_time(us)
+                if hasattr(self.lab, "refresh_exposure"):
+                    self.lab.refresh_exposure()
+                self.log(f"Basler exposure set to {us:.0f} µs (Live window shows it now).")
+        except Exception as e:  # noqa
+            if not quiet:
+                messagebox.showinfo("Exposure", f"Could not set the Basler exposure: {e}")
+            return False
+        return True
 
     # ---- Blackfly gamma / white balance (top bar)
     def _bf_cam(self):
@@ -445,10 +491,56 @@ class App:
         self._build_live()
         self.nb = nb
 
+    def _scroll_tab(self, title, padding):
+        """A notebook tab whose content sits on a canvas: when the window is smaller than the
+        content needs, scrollbars appear; when it is bigger, the content fills the tab as
+        usual (stretchy parts like the output panel grow). Returns (tab, content frame)."""
+        tab = ttk.Frame(self.nb)
+        self.nb.add(tab, text=title)
+        bg = ttk.Style(self.root).lookup("TFrame", "background") or self.root.cget("background")
+        canvas = tk.Canvas(tab, highlightthickness=0, bd=0, background=bg)
+        vsb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        hsb = ttk.Scrollbar(tab, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+        inner = ttk.Frame(canvas, padding=padding)
+        win = canvas.create_window(0, 0, window=inner, anchor="nw")
+        busy = {"v": False}
+
+        def layout(_e=None):
+            if busy["v"]:
+                return
+            busy["v"] = True
+            try:
+                cw, ch = canvas.winfo_width(), canvas.winfo_height()
+                if cw < 20 or ch < 20:
+                    return
+                rw, rh = inner.winfo_reqwidth(), inner.winfo_reqheight()
+                need_h, need_v = rw > cw, rh > ch
+                (vsb.grid(row=0, column=1, sticky="ns") if need_v else vsb.grid_remove())
+                (hsb.grid(row=1, column=0, sticky="ew") if need_h else hsb.grid_remove())
+                w, h = max(cw, rw), max(ch, rh)
+                canvas.itemconfigure(win, width=w, height=h)
+                canvas.configure(scrollregion=(0, 0, w, h))
+                if not need_v:
+                    canvas.yview_moveto(0)
+                if not need_h:
+                    canvas.xview_moveto(0)
+            except tk.TclError:
+                pass
+            finally:
+                busy["v"] = False
+
+        canvas.bind("<Configure>", layout, add="+")
+        inner.bind("<Configure>", lambda e: self.root.after_idle(layout), add="+")
+        self._scrollers.append((canvas, inner, vsb))
+        return tab, inner
+
     def _build_calibrate(self):
-        f = ttk.Frame(self.nb, padding=10)
-        self.nb.add(f, text="1  Calibrate")
-        self.cal_tab = f
+        tab, f = self._scroll_tab("1  Calibrate", 10)
+        self.cal_tab = tab
         f.columnconfigure(0, weight=1)
         ttk.Label(f, text="Once per optical setup. Nothing in the setup may move between calibration and scene "
                           "captures. Capture each laser with its own button, in any order.",
@@ -707,13 +799,35 @@ class App:
         ttk.Entry(bar, textvariable=self.scene_var, width=16).pack(side="left", padx=4)
         ttk.Label(bar, text="Basler exposure (µs)").pack(side="left", padx=(8, 0))
         self.cap_exp = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.cap_exp, width=10).pack(side="left", padx=4)
+        self.cap_exp_entry = ttk.Entry(bar, textvariable=self.cap_exp, width=10)
+        self.cap_exp_entry.pack(side="left", padx=4)
+        # this box always shows the camera's exposure (what the Live window shows); typing a
+        # value and pressing Enter (or leaving the box) sets the camera to it
+        self.cap_exp_entry.bind("<Return>", lambda e: self._apply_cap_exposure())
+        self.cap_exp_entry.bind("<FocusOut>", lambda e: self._apply_cap_exposure(quiet=True))
         self.bf_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="+ Blackfly RGB", variable=self.bf_var).pack(side="left", padx=8)
         ttk.Button(bar, text="Capture scene (zero + 56 masks + zero)", command=self.run_capture).pack(side="left", padx=4)
         ttk.Button(bar, text="Live window ⧉", command=self.open_live_window).pack(side="left", padx=4)
         self.cap_info = ttk.Label(bar, text="", foreground=self.C["muted"])
         self.cap_info.pack(side="left", padx=8)
+        # moving object: one sparse-mask frame + one black frame per position
+        bar2 = ttk.Frame(f, padding=(8, 0, 8, 6))
+        bar2.pack(fill="x")
+        ttk.Label(bar2, text="Moving object:", font=("TkDefaultFont", 11, "bold")).pack(side="left")
+        ttk.Label(bar2, text="  Scene name").pack(side="left")
+        self.pos_scene_var = tk.StringVar()
+        ttk.Entry(bar2, textvariable=self.pos_scene_var, width=16).pack(side="left", padx=4)
+        self.pos_scene_var.trace_add("write", lambda *_: self._pos_refresh())
+        ttk.Label(bar2, text="Mask").pack(side="left", padx=(8, 2))
+        self.pos_mask = None                     # None = scan mask_00
+        self.pos_mask_label = ttk.Label(bar2, text="mask_00", foreground=self.C["text2"])
+        self.pos_mask_label.pack(side="left")
+        ttk.Button(bar2, text="Choose…", command=self._pos_choose_mask).pack(side="left", padx=(4, 8))
+        ttk.Button(bar2, text="Capture position (mask + black)", command=self.run_position).pack(side="left", padx=4)
+        ttk.Button(bar2, text="Export positions", command=self.run_pos_export).pack(side="left", padx=4)
+        self.pos_info = ttk.Label(bar2, text="", foreground=self.C["muted"])
+        self.pos_info.pack(side="left", padx=8)
         self.cap_canvas = None
         ttk.Separator(f).pack(fill="x")
         # The camera GUI sits on a scrollable canvas: it always gets at least the size its
@@ -731,6 +845,7 @@ class App:
         holder = _LabHost(canvas)
         self._cap_win = canvas.create_window(0, 0, window=holder, anchor="nw")
         self._cap_canvas, self._cap_holder = canvas, holder
+        self._scrollers.append((canvas, holder, self._cap_vsb))
         self.lab = self.labmod.App(holder, self.mirrored)
         self.lab.load_saved_folders()
         if not self.lab.mask_root_folders:
@@ -745,8 +860,6 @@ class App:
             self.lab.top_section.bind("<Configure>", lambda e: self.root.after(60, self._cap_layout), add="+")
         except AttributeError:
             pass
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.root.bind_all(seq, self._cap_wheel, add="+")
 
     MIN_PREVIEW, MIN_LOG = 230, 90
 
@@ -789,22 +902,23 @@ class App:
             self._cap_in_layout = False
         self._schedule_fit()
 
-    def _cap_wheel(self, e):
-        """Mouse wheel / trackpad over the Capture tab scrolls it (when it is scrollable),
-        except over widgets that scroll themselves (mask tree, log, previews)."""
-        c = getattr(self, "_cap_canvas", None)
-        if c is None or not self._cap_vsb.winfo_ismapped():
-            return
+    def _tab_wheel(self, e):
+        """Mouse wheel / trackpad over a scrollable tab scrolls it (when it is scrollable),
+        except over widgets that scroll themselves (output panel, logs, lists, mask tree)."""
         w = e.widget
         if not isinstance(w, tk.Misc) or isinstance(w, (tk.Text, tk.Listbox, ttk.Treeview)):
             return
-        if not (w is c or str(w).startswith(str(self._cap_holder))):
-            return
-        if getattr(e, "num", None) in (4, 5):
-            step = -1 if e.num == 4 else 1
-        else:
-            step = -e.delta if sys.platform == "darwin" else -(e.delta // 120)
-        c.yview_scroll(int(step), "units")
+        name = str(w)
+        for canvas, content, vsb in self._scrollers:
+            if w is canvas or name == str(content) or name.startswith(str(content) + "."):
+                if not vsb.winfo_ismapped():
+                    return
+                if getattr(e, "num", None) in (4, 5):
+                    step = -1 if e.num == 4 else 1
+                else:
+                    step = -e.delta if sys.platform == "darwin" else -(e.delta // 120)
+                canvas.yview_scroll(int(step), "units")
+                return
 
     def _hide_lab_live(self):
         """Inside the pipeline the live feed lives in its own window (Live window ⧉), so hide
@@ -886,8 +1000,7 @@ class App:
             pass
 
     def _build_cube(self):
-        f = ttk.Frame(self.nb, padding=6)
-        self.nb.add(f, text="3  Cube")
+        _tab, f = self._scroll_tab("3  Cube", 6)
         left = ttk.Frame(f); left.pack(side="left", fill="y")
         ttk.Label(left, text="Scenes").pack(anchor="w")
         self.scene_list = tk.Listbox(left, width=26, height=14, exportselection=False)
@@ -1085,6 +1198,8 @@ class App:
                 txt += f" (left-right {r['shift_x']['predicted_px']:+} predicted vs {r['shift_x']['measured_px']:+} px)"
             parts.append(txt)
         self.cal_summary.configure(text="   ·   ".join(parts))
+        if hasattr(self, "pos_info"):
+            self._pos_refresh()
         self.scene_list.delete(0, "end")
         for sc in s.scenes():
             has = (s.scene_dir(sc) / "cubes" / "cube_combined.npz").is_file()
@@ -1268,7 +1383,69 @@ class App:
                 self.q.put(("done", False, f"ERROR: {e}"))
         threading.Thread(target=work, daemon=True).start()
 
+    # ------------------------------------------------------------------ moving object (positions)
+    def _pos_count(self, scene):
+        try:
+            d = self.session.scene_dir(scene) / "positions"
+        except (ValueError, AttributeError):
+            return 0
+        return len([p for p in d.glob("pos_*") if (p / "position.json").is_file()]) if d.is_dir() else 0
+
+    def _pos_refresh(self):
+        scene = self.pos_scene_var.get().strip()
+        if not scene or self.session is None:
+            self.pos_info.configure(text="uses the exposure + Blackfly setting above")
+            return
+        n = self._pos_count(scene)
+        exported = self.session.scene_dir(scene) / "sparse_export"
+        self.pos_info.configure(text=f"{n} position{'s' if n != 1 else ''} captured · next: position {n + 1}"
+                                     + ("  · exported" if exported.is_dir() and n else ""))
+
+    def _pos_choose_mask(self):
+        from tkinter import filedialog
+        start = self.session.lab_path("scan_masks") if self.session else Path.home()
+        p = filedialog.askopenfilename(title="Mask on the SLM for each position", initialdir=str(start),
+                                       filetypes=[("PNG", "*.png")])
+        if p:
+            self.pos_mask = Path(p)
+            self.pos_mask_label.configure(text=self.pos_mask.stem)
+
+    def run_position(self):
+        if not self._apply_cap_exposure():
+            return
+        if not self.session or not self.save_form() or not self._need_rig():
+            return
+        scene = self.pos_scene_var.get().strip()
+        if not scene:
+            messagebox.showinfo("Moving object", "Enter a scene name for the positions."); return
+        k = self._pos_count(scene) + 1
+        if not self._start(f"Position {k} of {scene}"):
+            return
+        self.live_on = False
+        self.rig.settle_s = self.session.settings["settle_ms"] / 1000
+
+        def work():
+            import stages
+            try:
+                stages.capture_position(self.session, self.rig, scene, self.ui, log=self.log,
+                                        mask_path=self.pos_mask, use_blackfly=self.bf_var.get())
+                self.q.put(("done", True, f"Position {k} of '{scene}' captured. Move the object, then "
+                                          f"press Capture position again (or Export positions)."))
+            except Exception as e:  # noqa
+                self.q.put(("done", False, f"ERROR: {e}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_pos_export(self):
+        scene = self.pos_scene_var.get().strip()
+        if not scene:
+            messagebox.showinfo("Moving object", "Enter the scene name of the positions to export."); return
+        if not self._pos_count(scene):
+            messagebox.showinfo("Moving object", f"No captured positions in '{scene}' yet."); return
+        self.run_proc(["sparse-export", "{S}", scene], what=f"Export positions of {scene}")
+
     def run_capture(self):
+        if not self._apply_cap_exposure():
+            return
         if not self.session or not self.save_form() or not self._need_rig():
             return
         scene = self.scene_var.get().strip()
@@ -1310,7 +1487,7 @@ class App:
         raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         if raw is None:
             return
-        ph, _ = to_photo(stretch(raw[::4, ::4]), 640, 430)
+        ph, _ = to_photo(stretch(raw[::4, ::4], saturate=65520 if raw.max() > 4095 else 4095), 640, 430)
         self._photos["cap"] = ph
         self.cap_canvas.delete("all"); self.cap_canvas.create_image(0, 0, image=ph, anchor="nw")
         self.cap_info.configure(text=f"last frame: {path.name}   mean {raw.mean():.0f}   max {raw.max()}")
@@ -1375,6 +1552,10 @@ class App:
             info.append(f"captured {m['captured']}\nexposure {exp}" + ("\n(imported)" if m.get("imported_from") else ""))
             if m.get("zero_drift") is not None:
                 info.append(f"zero drift {m['zero_drift']:.1%}")
+        n_pos = self._pos_count(sc)
+        if n_pos:
+            info.append(f"moving object: {n_pos} positions (mask + black each)"
+                        + ("\nexported: sparse_export/" if (d / "sparse_export").is_dir() else ""))
         if (d / "check.json").is_file():
             r = json.loads((d / "check.json").read_text())
             info.append("check: " + ("PASSED" if r["passed"] else "FAILED - " + " ".join(r["problems"])))
@@ -1452,6 +1633,34 @@ class App:
         c.create_line(*pts, fill="#2266cc", width=2)
 
     # ------------------------------------------------------------------ live window
+    _LIVE_GEOMETRY = PIPELINE_DIR / "labgui_state" / "live_window.json"
+
+    def _open_live_at_start(self):
+        """Open the Live window when the GUI starts (it shows "open the Basler first" until
+        a camera is open). It goes where it was last time; the first time, bottom-right."""
+        try:
+            self.open_live_window()
+            geo = None
+            if self._LIVE_GEOMETRY.is_file():
+                geo = json.loads(self._LIVE_GEOMETRY.read_text()).get("geometry")
+            if not geo:
+                sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+                w, h = min(680, sw // 2), min(520, sh // 2)
+                geo = f"{w}x{h}+{sw - w - 20}+{max(60, sh - h - 90)}"
+            self.live_window.win.geometry(geo)
+            self.live_window.win.lift()
+        except (tk.TclError, ValueError, OSError):
+            pass
+
+    def _save_live_geometry(self):
+        lw = getattr(self, "live_window", None)
+        try:
+            if lw is not None and lw.alive():
+                self._LIVE_GEOMETRY.parent.mkdir(parents=True, exist_ok=True)
+                self._LIVE_GEOMETRY.write_text(json.dumps({"geometry": lw.win.geometry()}))
+        except (tk.TclError, OSError):
+            pass
+
     def open_live_window(self):
         lw = getattr(self, "live_window", None)
         if lw is not None and lw.alive():
@@ -1475,6 +1684,7 @@ class App:
             return
         self.stop()
         self.live_on = False
+        self._save_live_geometry()
         try:
             if self.rig:
                 self.rig.close()
@@ -1538,6 +1748,7 @@ class LiveWindow:
     def close(self):
         if self._after:
             self.win.after_cancel(self._after)
+        self.app._save_live_geometry()           # reopen it in the same place next time
         self.win.destroy()
 
     def _msg(self, text):

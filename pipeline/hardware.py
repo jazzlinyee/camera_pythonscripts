@@ -261,13 +261,17 @@ class LabGuiRig(_Base):
         (its live panes are hidden inside the pipeline)."""
         def show():
             try:
-                f = frame[::8, ::8] if choice == "basler" else frame
-                disp = self.lab._live_display_frame(choice, f)
+                if choice == "basler":
+                    # true brightness, no stretching: raw 0-4095 -> 0-255 (what was really recorded)
+                    f = np.clip(frame[::8, ::8], 0, 4095).astype(np.float32)
+                    disp = (f * (255.0 / 4095.0)).astype(np.uint8)
+                else:
+                    disp = self.lab._live_display_frame(choice, frame)      # Bayer -> colour only
                 ph = self.labmod.array_to_photoimage(disp, *self.lab.preview_sizes[choice])
                 if choice == "basler":
                     self.lab._basler_thumb_photo = ph
                     self.lab.basler_preview_label.configure(image=ph)
-                    self.lab.basler_path_label.configure(text="(pipeline capture - auto-contrast preview)")
+                    self.lab.basler_path_label.configure(text="(pipeline capture - true brightness)")
                 else:
                     self.lab._blackfly_thumb_photo = ph
                     self.lab.blackfly_preview_label.configure(image=ph)

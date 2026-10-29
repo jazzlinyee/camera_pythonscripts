@@ -120,10 +120,10 @@ def accumulate(g, open_mask, tx, ty, total, count):
         count[keep, b] += 1
 
 
-def reconstruct(pairs, zero_path, table, extend=True, degree=4, log=print):
+def reconstruct(pairs, zero_path, table, extend=True, degree=4, log=print, scale=1):
     rx, ry, wl = load_table(table)
     nt, H, W = rx.shape
-    zero = read_image(zero_path)
+    zero = read_image(zero_path) / float(scale or 1)
     if extend:
         tx, ty, extended = extend_table(rx, ry, zero.shape, degree, log)
     else:
@@ -136,7 +136,7 @@ def reconstruct(pairs, zero_path, table, extend=True, degree=4, log=print):
         m = cv2.imread(str(mask), cv2.IMREAD_GRAYSCALE)
         if m is None or m.shape != (H, W):
             sys.exit(f"Mask {mask} missing or not {W}x{H}")
-        accumulate(read_image(cap) - zero, m > 0, tx, ty, total, count)
+        accumulate(read_image(cap) / float(scale or 1) - zero, m > 0, tx, ty, total, count)
         if n % 8 == 0 or n == len(pairs):
             log(f"  {n}/{len(pairs)} frames ({time.time() - t0:.0f}s)")
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -205,11 +205,11 @@ def save(out, cube, wl, source, coverage, log=print):
 
 
 def build(pairs=None, zero=None, table=None, cubes=None, out=None, extend=True, degree=4,
-          qe="multiply", qe_csv=None, log=print):
+          qe="multiply", qe_csv=None, log=print, scale=1):
     if cubes:
         cube, wl, source, cov = merge_cubes(cubes, log)        # per-frame cubes already have QE
     else:
-        cube, wl, source, cov = reconstruct(pairs, zero, table, extend, degree, log)
+        cube, wl, source, cov = reconstruct(pairs, zero, table, extend, degree, log, scale=scale)
         if not qe_csv:
             sys.path.insert(0, str(HERE))
             from settings import default_lab_path
@@ -254,19 +254,24 @@ def main():
         from settings import Session
         session = Session(sd.resolve().parent.parent.name, root=sd.resolve().parent.parent.parent)
         pairs, zero = scene_pairs(sd), sd / "captures" / "zero.tiff"
+        man = json.loads((sd / "manifest.json").read_text())
+        scale = man.get("pixel_scale", 1)
         table = Path(a.table) if a.table else session.table
         out = a.out or sd / "cubes" / "cube_full.npz"
     else:
         if not (a.zero and a.captures and a.masks and a.table and a.out):
             sys.exit("Give a scene folder, or --zero --captures --masks --table --out, or --cubes.")
         zero = Path(a.zero)
+        scale = 16 if read_image(zero).max() > 4095 else 1      # camera-GUI captures are saved x16
+        print(f"Pixel values: {'x16 (MSB-aligned) - divided by 16' if scale == 16 else 'raw 12-bit'}")
         caps = [c for c in _glob(a.captures) if c.resolve() != zero.resolve()]
         masks = _glob(a.masks)
         if len(caps) != len(masks):
             sys.exit(f"{len(caps)} captures but {len(masks)} masks - they must pair up in sorted order.")
         pairs, table, out = list(zip(caps, masks)), Path(a.table), a.out
         print("Pairs:", f"{caps[0].name}+{masks[0].name} ... {caps[-1].name}+{masks[-1].name}")
-    build(pairs, zero, table, out=out, extend=not a.no_extend, degree=a.degree, qe=a.qe, qe_csv=a.qe_csv)
+    build(pairs, zero, table, out=out, extend=not a.no_extend, degree=a.degree, qe=a.qe, qe_csv=a.qe_csv,
+          scale=scale)
 
 
 if __name__ == "__main__":

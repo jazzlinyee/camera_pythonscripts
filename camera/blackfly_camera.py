@@ -77,8 +77,20 @@ except ImportError:
     PySpin = None
 
 
+def save_raw_bytes(img_array, raw_path: Union[str, Path]) -> Path:
+    """Write a frame as a headerless .raw file: the pixel values only, row by row
+    (for BayerRG8: 1080 x 1440 bytes). Same layout as the lab's img_rgb.raw."""
+    import numpy as np
+    raw_path = Path(raw_path)
+    np.ascontiguousarray(img_array).tofile(raw_path)
+    return raw_path
+
+
 class BlackflyCamera(Camera):
     """Controls one FLIR Blackfly S camera via the Spinnaker SDK (PySpin)."""
+
+    # capture() also writes a .raw copy next to the .png (2026-10-29)
+    save_raw_copy = True
 
     def __init__(
         self,
@@ -331,7 +343,10 @@ class BlackflyCamera(Camera):
         Waits up to 5 seconds for a frame. Saves the RAW sensor readout --
         the native Bayer mosaic, with no demosaic/color conversion and no
         gamma or white-balance correction (both disabled in _configure())
-        -- as an 8-bit single-channel PNG.
+        -- as an 8-bit single-channel PNG, plus (since 2026-10-29) the same bytes
+        as a headerless .raw file next to it (same name, .raw): height x width
+        uint8, row by row -- the format of the lab's img_rgb.raw. Read it back with
+        np.fromfile(path, np.uint8).reshape(1080, 1440).
 
         Raises:
             CameraError: if start() hasn't been called yet, or the grabbed
@@ -353,6 +368,8 @@ class BlackflyCamera(Camera):
             # this a raw capture (see module docstring).
             img_array = image_result.GetNDArray()
             self._save_array(img_array, save_path)
+            if self.save_raw_copy:
+                save_raw_bytes(img_array, save_path.with_suffix(".raw"))
             return save_path
         finally:
             image_result.Release()

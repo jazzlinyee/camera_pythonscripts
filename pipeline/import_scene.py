@@ -105,6 +105,8 @@ def main():
         rgb = src / f.name.replace("basler_", "blackfly_").replace(".tiff", ".png").replace(".tif", ".png")
         if rgb.is_file():
             shutil.copy2(rgb, cap / "rgb" / f"rgb_{k:02d}.png")
+            if rgb.with_suffix(".raw").is_file():
+                shutil.copy2(rgb.with_suffix(".raw"), cap / "rgb" / f"rgb_{k:02d}.raw")
             bf += 1
         frames.append({"frame": k, "dy": r["dy"], "dx": r["dx"], "mask": f"masks/{Path(r['mask']).name}",
                        "capture": f"captures/scan_{k:02d}.tiff", "source_file": f.name})

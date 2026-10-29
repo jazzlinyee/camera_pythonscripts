@@ -84,6 +84,22 @@ def cmd_capture(a):
         rig.close()
 
 
+def cmd_position(a):
+    import stages
+    s = Session(a.session)
+    rig = _rig(s)
+    rig.open(blackfly=s.settings["blackfly"]["enabled"])
+    try:
+        stages.capture_position(s, rig, a.scene, stages.ConsoleUI(), mask_path=a.mask)
+    finally:
+        rig.close()
+
+
+def cmd_sparse_export(a):
+    import stages
+    stages.export_positions(Session(a.session), a.scene, background="none")
+
+
 def cmd_cube(a):
     import stages
     stages.make_cube(Session(a.session), a.scene, force=a.force)
@@ -105,6 +121,11 @@ def main(argv=None):
     c.add_argument("--laser", help="capture only this laser (folder name, e.g. Blue); default: all, in list order")
     c.set_defaults(f=cmd_calibrate)
     cp = sub.add_parser("capture"); cp.add_argument("session"); cp.add_argument("scene"); cp.set_defaults(f=cmd_capture)
+    po = sub.add_parser("position", help="capture one position of a moving object (sparse mask + black)")
+    po.add_argument("session"); po.add_argument("scene"); po.add_argument("--mask", help="default: scan mask_00")
+    po.set_defaults(f=cmd_position)
+    se = sub.add_parser("sparse-export", help="sparse cube + RGB for every captured position")
+    se.add_argument("session"); se.add_argument("scene"); se.set_defaults(f=cmd_sparse_export)
     cu = sub.add_parser("cube"); cu.add_argument("session"); cu.add_argument("scene")
     cu.add_argument("--force", action="store_true", help="make the cube even if the orientation check fails")
     cu.set_defaults(f=cmd_cube)

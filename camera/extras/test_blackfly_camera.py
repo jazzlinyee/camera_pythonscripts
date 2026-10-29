@@ -257,6 +257,22 @@ class BlackflyCameraTests(unittest.TestCase):
             self.assertEqual(result_path, save_path)
             self.assertTrue(save_path.exists())
 
+    def test_capture_also_writes_headerless_raw_with_the_same_pixels(self):
+        cam = self._open_camera()
+        cam.start()
+        frame = (np.arange(6 * 8) % 256).astype(np.uint8).reshape(6, 8)
+        fake_image = MagicMock(name="ImageResult")
+        fake_image.IsIncomplete.return_value = False
+        fake_image.GetNDArray.return_value = frame
+        self.fake_cam.GetNextImage.return_value = fake_image
+        with tempfile.TemporaryDirectory() as tmp:
+            cam.capture(Path(tmp) / "blackfly_000.png")
+            raw = Path(tmp) / "blackfly_000.raw"
+            self.assertTrue(raw.exists())
+            self.assertEqual(raw.stat().st_size, frame.size)          # no header
+            back = np.fromfile(raw, dtype=np.uint8).reshape(6, 8)
+            np.testing.assert_array_equal(back, frame)
+
     def test_capture_raises_on_incomplete_image_and_still_releases(self):
         cam = self._open_camera()
         cam.start()

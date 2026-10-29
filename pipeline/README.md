@@ -123,6 +123,29 @@ python pipeline.py cube    101426 scene1           # ~10-20 min
 python pipeline.py status  101426
 ```
 
+## Moving object (sparse positions)
+
+For an object that moves (like video), each position gets one sparse-mask frame and one black
+frame, back to back, instead of a full scan. On the **2 Capture** tab, row **Moving object**:
+
+1. Enter a scene name (different from any full-scan scene). The mask is scan `mask_00` unless
+   you choose another one. The Basler exposure and the Blackfly checkbox from the row above
+   are used.
+2. **Capture position (mask + black)**: shows the mask and takes a Basler + Blackfly frame,
+   then shows black and takes a Basler frame. Saved in
+   `scenes/<scene>/positions/pos_NN/`: `mask.tiff`, `zero.tiff` (raw 12-bit), `rgb.png` + `rgb.raw`,
+   and `position.json` (exposure, mask, Blackfly settings, brightness, saturation).
+3. Move the object, press **Capture position** again, and so on.
+4. **Export positions**: sparse cube + RGB on SLM coordinates for every position, each with its
+   own black frame subtracted -> `scenes/<scene>/sparse_export/<scene>_pos_NN.npz` (same format as
+   `export_sparse.py`, see below). Needs `calibration/guide/guide_to_slm.npz`.
+
+For ground truth, capture a full scan of the (still) object as a separate scene with
+**Capture scene**, then **Make cube**.
+
+Command line: `python pipeline.py position <session> <scene>` (one position) and
+`python pipeline.py sparse-export <session> <scene>`.
+
 ## Fully sampled cube (`cube_full.npz`)
 
 The 56 scan masks together open every SLM pixel, so the scan is complete. The NaN holes in
@@ -173,9 +196,19 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
 ## Notes
 
 - **File formats.** Calibration captures are saved as 8-bit PNG (top 8 of 12 bits), which is
-  what `graycode.ipynb` expects. Scene captures are raw 12-bit values in 16-bit TIFF. This is
-  independent of `MSB_ALIGN_OUTPUT` in `basler_camera.py`, because frames are read with
-  `grab_preview()`, which always returns raw values.
+  what `graycode.ipynb` expects. Basler TIFFs (scenes, positions, check frames) are saved
+  **x16** (raw 12-bit value x 16, 0–65520, like the camera GUI), so they look normal in image
+  viewers; `manifest.json` / `position.json` / `check/scale.json` record `"pixel_scale": 16` and
+  every pipeline step divides by it, so cubes and exports stay in raw 12-bit units. Data
+  captured before 2026-10-30 is raw 12-bit (no `pixel_scale` recorded = 1).
+- **Exposure.** The Capture tab's "Basler exposure" box always shows the camera's current
+  exposure (the one the Live window shows); typing a value there sets the camera. Captures log
+  how full the sensor was and warn below 40 %.
+- **Blackfly frames** are the raw Bayer mosaic (BayerRG8, gamma and white balance off), saved
+  twice with the same bytes: `.png` (lossless, opens in viewers) and a headerless `.raw`
+  (1080 x 1440 uint8, row by row, like the lab's `img_rgb.raw`; read it with
+  `np.fromfile(path, np.uint8).reshape(1080, 1440)`). Their settings are recorded in the scene's
+  `manifest.json` (pipeline) or `blackfly_settings.json` (camera GUI captures).
 - **QE correction.** `meas2hyper.ipynb` multiplies by the QE curve, and the pipeline runs it
   as written. If the lab changes this, the pipeline picks up the change automatically.
 - **Gray-code patterns** are read from `calibration/patterns/` (made by graycode.ipynb's first cell).
