@@ -42,6 +42,11 @@ here -- it's a blocking call that would prevent interleaving captures.
 Use "m <index>" to switch masks manually between captures instead.
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # the drivers are in camera/, one folder up
+
+
 import sys
 from pathlib import Path
 

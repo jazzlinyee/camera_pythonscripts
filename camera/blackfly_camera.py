@@ -19,7 +19,8 @@ Capture policy (set after the 2026-09 meeting):
     turned off, and the red/blue white-balance ratios set to 1.0 (neutral;
     added 2026-10-28 -- switching auto white balance off only freezes them).
     Run check_blackfly_raw.py with the camera connected to read the
-    settings back from the camera. There is no demosaic/color-conversion step in capture()
+    settings back from the camera. set_gamma() / set_white_balance() can switch
+    them on for a test (2026-10-29); open() always starts with both off. There is no demosaic/color-conversion step in capture()
     on purpose: converting to a viewable color image is exactly the kind
     of processing this policy is meant to avoid. Frames are still written
     out as .png (PNG happily stores a single-channel 8-bit array; it just
@@ -286,6 +287,33 @@ class BlackflyCamera(Camera):
             out[key] = "n/a" if node is None else (value(node) if key in ("IspEnable", "BlackLevel", "Gain") else enum(node))
         out["note"] = getattr(self, "balance_ratio_note", "")
         return out
+
+    def set_gamma(self, on: bool) -> None:
+        """Turn the camera's gamma correction on or off (added 2026-10-29).
+        Off = raw sensor response, which is also what open() sets."""
+        if not self._is_open:
+            raise CameraError("Camera is not open. Call open() first.")
+        node = self._cam.GammaEnable
+        if not (PySpin.IsAvailable(node) and PySpin.IsWritable(node)):
+            raise CameraError("This camera has no writable GammaEnable setting.")
+        node.SetValue(bool(on))
+
+    def set_white_balance(self, on: bool) -> str:
+        """Turn automatic white balance on (BalanceWhiteAuto = Continuous) or off
+        (added 2026-10-29). Off also puts the red/blue ratios back to 1.0, i.e. no colour
+        gain - what open() sets. Returns a short note about the ratios."""
+        if not self._is_open:
+            raise CameraError("Camera is not open. Call open() first.")
+        node = self._cam.BalanceWhiteAuto
+        if not (PySpin.IsAvailable(node) and PySpin.IsWritable(node)):
+            raise CameraError("This camera has no writable BalanceWhiteAuto setting.")
+        if on:
+            node.SetValue(PySpin.BalanceWhiteAuto_Continuous)
+            self.balance_ratio_note = "automatic white balance ON"
+        else:
+            node.SetValue(PySpin.BalanceWhiteAuto_Off)
+            self.balance_ratio_note = self._set_neutral_balance()
+        return self.balance_ratio_note
 
     def get_exposure_time(self) -> float:
         """Return the camera's current exposure time, in microseconds.

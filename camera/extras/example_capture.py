@@ -15,6 +15,11 @@ Output format (2026-09 meeting policy):
     - Basler:   true 12-bit mono (Mono12 -> Mono16), .tiff
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # the drivers are in camera/, one folder up
+
+
 from pathlib import Path
 
 from blackfly_camera import BlackflyCamera

@@ -22,6 +22,11 @@ have real mask images ready yet. Swap in load_masks_from_folder("masks/")
 once you have actual mask files.
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # the drivers are in camera/, one folder up
+
+
 import numpy as np
 
 from slm_display import SLMDisplay

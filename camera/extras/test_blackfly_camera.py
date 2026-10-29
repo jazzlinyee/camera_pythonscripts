@@ -16,6 +16,11 @@ Run:
     python3 -m pytest test_blackfly_camera.py -v
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # the drivers are in camera/, one folder up
+
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +44,7 @@ def make_fake_pyspin():
     fake.PixelFormat_BayerRG8 = "PixelFormat_BayerRG8"
     fake.BalanceRatioSelector_Red = "BalanceRatioSelector_Red"
     fake.BalanceRatioSelector_Blue = "BalanceRatioSelector_Blue"
+    fake.BalanceWhiteAuto_Continuous = "BalanceWhiteAuto_Continuous"
 
     fake.IsWritable.return_value = True
     fake.IsAvailable.return_value = True
@@ -139,6 +145,31 @@ class BlackflyCameraTests(unittest.TestCase):
         self.assertEqual(s["PixelFormat"], "BayerRG8")
         self.assertIs(s["GammaEnable"], False)
         self.assertEqual((s["BalanceRatio_Red"], s["BalanceRatio_Blue"]), (1.0, 1.0))
+
+    def test_set_gamma_turns_it_on_and_off(self):
+        cam = self._open_camera()
+        self.fake_cam.GammaEnable.SetValue.reset_mock()
+        cam.set_gamma(True)
+        cam.set_gamma(False)
+        self.assertEqual([c.args[0] for c in self.fake_cam.GammaEnable.SetValue.call_args_list], [True, False])
+
+    def test_set_white_balance_on_is_auto_and_off_resets_ratios(self):
+        cam = self._open_camera()
+        self.fake_cam.BalanceWhiteAuto.SetValue.reset_mock()
+        self.fake_cam.BalanceRatio.SetValue.reset_mock()
+        cam.set_white_balance(True)
+        self.fake_cam.BalanceWhiteAuto.SetValue.assert_called_with("BalanceWhiteAuto_Continuous")
+        self.fake_cam.BalanceRatio.SetValue.assert_not_called()
+        cam.set_white_balance(False)
+        self.fake_cam.BalanceWhiteAuto.SetValue.assert_called_with("BalanceWhiteAuto_Off")
+        self.assertEqual([c.args[0] for c in self.fake_cam.BalanceRatio.SetValue.call_args_list], [1.0, 1.0])
+
+    def test_gamma_and_white_balance_need_an_open_camera(self):
+        cam = blackfly_camera.BlackflyCamera()
+        with self.assertRaises(CameraError):
+            cam.set_gamma(False)
+        with self.assertRaises(CameraError):
+            cam.set_white_balance(False)
 
     def test_configure_sets_exposure_and_gain_when_given(self):
         self._open_camera(exposure_us=8000, gain_db=3.5)

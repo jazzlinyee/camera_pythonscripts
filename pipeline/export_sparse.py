@@ -4,7 +4,9 @@ export_sparse.py - sparsely sampled cube + RGB image on SLM coordinates, one fil
 capture, in the format of the lab's dataprep.ipynb (June meas_QE.npz).
 
 For each Basler capture taken with ONE mask on the SLM (e.g. test_masks/mask_00.png):
-  1. background: subtracted using --zero if given, otherwise ESTIMATED (see below)
+  1. background: NOT subtracted by default (--background none, 2026-10-29: the PhD student
+     comments out the zero subtraction in meas2hyper). --zero FILE subtracts a real
+     black-mask frame; --background estimate uses the estimate described below.
   2. sparse cube: meas2hyper's calculation (same code as meas2hyper.ipynb cells 6-7,
      verified identical), x QE, then averaged over each 3x3 block like dataprep.ipynb
   3. RGB: the Blackfly frame taken at the same moment, debayered + flipped vertically and
@@ -19,14 +21,16 @@ Output per capture: <out>/<basler name>.npz with
     hypercube        (1080,1920,31) float32  3x3-averaged sparse cube, normalised to max 1
                                              (exactly like dataprep.ipynb), 0 = not sampled
     hypercube_raw    same, not normalised (raw 12-bit units x QE)
-    hypercube_nosub  same as hypercube_raw but with NO background subtraction
+    hypercube_nosub  (only when a background was subtracted) the same without subtraction
     mask             (1080,1920) float32 1 = open SLM pixel
     rgb              (1080,1920,3) float32 0-1, Blackfly image on SLM coordinates
                      (channel order as dataprep.ipynb produces it)
     rgb_valid        (1080,1920) bool, where the Blackfly sees the SLM
     wavelengths      (31,) nm
-    background       'measured' or 'estimated', plus the source file names
-and <basler name>_preview.png (left: cube rendered as colour, right: RGB on SLM).
+    info             JSON: background ('none' / 'measured' / 'estimated') and the source files
+and <basler name>_preview.png: top = whole SLM, bottom = zoom on the area the Blackfly sees;
+left = sparse cube rendered as colour (gaps filled from the nearest block, for viewing only),
+right = Blackfly RGB on SLM coordinates.
 
 Background estimate (no black frame): background = alpha x (Gaussian blur, sigma 8 px, of the
 capture itself), with alpha = 0.962 measured on manual_scene (which has a real black frame).
@@ -114,10 +118,30 @@ def rgb_on_slm(bf_path, gx, gy):
     return (out / 255.0).astype(np.float32)
 
 
-def preview(cube, wl, rgb, path):
-    c = np.nan_to_num(fc.to_rgb(np.nan_to_num(cube), wl))[..., ::-1]      # to_rgb gives RGB
-    r = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)                        # dataprep order shown as-is
-    cv2.imwrite(str(path), np.hstack([c, r[..., ::-1]])[::2, ::2])
+_FILL = {}
+
+
+def preview(cube, wl, rgb, rgb_valid, mask, path):
+    """Viewing aid only: the sparse cube rendered as colour with each gap filled from the
+    nearest sampled block, next to the Blackfly RGB; whole SLM on top, Blackfly area below."""
+    key = mask.tobytes()[:64] + bytes(str(mask.sum()), "ascii")
+    if key not in _FILL:
+        from scipy.ndimage import distance_transform_edt
+        _FILL.clear()
+        _FILL[key] = distance_transform_edt(~mask, return_distances=False, return_indices=True)
+    iy, ix = _FILL[key]
+    c = fc.to_rgb(np.nan_to_num(cube), wl)[iy, ix]                       # RGB
+    r = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)                       # dataprep order, shown as RGB
+    top = np.hstack([c, r])[::2, ::2]
+    ys, xs = np.nonzero(rgb_valid)
+    if len(ys):
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        zc, zr = c[y0:y1, x0:x1], r[y0:y1, x0:x1]
+        bot = np.hstack([zc, zr])
+        scale = top.shape[1] / bot.shape[1]
+        bot = cv2.resize(bot, (top.shape[1], max(1, int(bot.shape[0] * scale))), interpolation=cv2.INTER_NEAREST)
+        top = np.vstack([top, np.full((6, top.shape[1], 3), 255, np.uint8), bot])
+    cv2.imwrite(str(path), top[..., ::-1])
 
 
 def main():
@@ -127,7 +151,9 @@ def main():
     ap.add_argument("--guide", required=True, help="guide_to_slm.npz from guide_calib.ipynb")
     ap.add_argument("--mask", required=True, help="the mask that was on the SLM for every capture")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--zero", help="a real black-mask frame (then no estimate is used)")
+    ap.add_argument("--zero", help="subtract this real black-mask frame")
+    ap.add_argument("--background", choices=["none", "estimate"], default="none",
+                    help="without --zero: none (default) or the in-frame estimate")
     ap.add_argument("--qe-csv", default=str(default_lab_path("calibration_code") / "SonyIMX183.csv"))
     a = ap.parse_args()
 
@@ -151,8 +177,10 @@ def main():
     from scipy.ndimage import label
     labels, n = label(mask)
     zero = read_raw12(a.zero) if a.zero else None
-    print(f"RGB covers {rgb_valid.mean():.1%} of the SLM; mask has {n} open blocks; "
-          f"background: {'measured from ' + a.zero if zero is not None else 'ESTIMATED (no black frame)'}")
+    mode = "measured" if zero is not None else ("estimated" if a.background == "estimate" else "none")
+    print(f"RGB covers {rgb_valid.mean():.1%} of the SLM; mask has {n} open blocks; background: "
+          + {"measured": f"subtracted ({a.zero})", "estimated": "ESTIMATED and subtracted",
+             "none": "not subtracted"}[mode])
 
     for folder in map(Path, a.folders):
         files = sorted(folder.glob("basler_*.tiff"))
@@ -160,9 +188,12 @@ def main():
         bf_of = pair_blackfly(files, folder)
         for i, f in enumerate(files, 1):
             g = read_raw12(f)
-            bg = zero if zero is not None else ALPHA * cv2.GaussianBlur(g, (0, 0), SIGMA)
-            raw = block_average(sparse_cube(g - bg, mask, rx, ry, a.qe_csv), labels, n)
             nosub = block_average(sparse_cube(g, mask, rx, ry, a.qe_csv), labels, n)
+            if mode == "none":
+                raw = nosub
+            else:
+                bg = zero if mode == "measured" else ALPHA * cv2.GaussianBlur(g, (0, 0), SIGMA)
+                raw = block_average(sparse_cube(g - bg, mask, rx, ry, a.qe_csv), labels, n)
             hc = np.nan_to_num(raw)
             hc = np.clip(hc / hc.max(), 0, 1) if hc.max() > 0 else hc          # dataprep cell 5
             bf = bf_of[f]
@@ -170,16 +201,17 @@ def main():
             info = {"basler": f.name, "blackfly": bf.name if bf else None, "folder": str(folder.resolve()),
                     "mask": str(Path(a.mask).resolve()), "table": str(session.table),
                     "guide": str(Path(a.guide).resolve()), "made": datetime.now().isoformat(timespec="seconds"),
-                    "background": "measured" if zero is not None else "estimated",
-                    "background_method": (f"black frame {a.zero}" if zero is not None else
-                                          f"alpha {ALPHA} x GaussianBlur(capture, sigma {SIGMA})"),
+                    "background": mode,
+                    "background_method": {"none": "not subtracted",
+                                          "measured": f"black frame {a.zero}",
+                                          "estimated": f"alpha {ALPHA} x GaussianBlur(capture, sigma {SIGMA})"}[mode],
                     "qe": "multiplied (as meas2hyper.ipynb)", "units_raw": "raw 12-bit x QE"}
+            extra = {} if mode == "none" else {"hypercube_nosub": np.nan_to_num(nosub).astype(np.float32)}
             np.savez_compressed(out / f"{folder.name}_{f.stem}.npz", hypercube=hc.astype(np.float32),
                                 hypercube_raw=np.nan_to_num(raw).astype(np.float32),
-                                hypercube_nosub=np.nan_to_num(nosub).astype(np.float32),
                                 mask=mask.astype(np.float32), rgb=rgb, rgb_valid=rgb_valid,
-                                wavelengths=wl, info=json.dumps(info))
-            preview(raw, wl, rgb, out / f"{folder.name}_{f.stem}_preview.png")
+                                wavelengths=wl, info=json.dumps(info), **extra)
+            preview(raw, wl, rgb, rgb_valid, mask, out / f"{folder.name}_{f.stem}_preview.png")
             print(f"  [{i}/{len(files)}] {f.name} + {bf.name if bf else 'NO Blackfly frame'} -> "
                   f"{folder.name}_{f.stem}.npz")
     print("\ndone")

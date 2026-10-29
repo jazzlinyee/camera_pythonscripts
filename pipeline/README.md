@@ -14,8 +14,10 @@ swapped in memory, and the patched copy is run. The camera code is imported with
 ```
 comp vision lab/                  (any name; these folders must sit side by side)
   calibration/                    lab notebooks (git: raalkubaisy/calibration)   (read only)
-  camera_pythonscripts/           SLM + camera classes (git: jazzlinyee/camera_pythonscripts)
-    pipeline/                     this tool (part of the camera_pythonscripts repo)
+  camera_pythonscripts/           git: jazzlinyee/camera_pythonscripts
+    camera/                       SLM + camera drivers and the camera GUI (used by the pipeline)
+      extras/                     examples, tests, viewer (not needed to run anything)
+    pipeline/                     this tool
       masks/scan_masks/           black + 56 scan masks + scan_plan.csv (copied from slm_scan/)
       masks/test_masks/mask_00.png  the single mask for sparse measurements
       masks/slm_scan.py           the script that made the scan masks
@@ -71,7 +73,7 @@ This opens **one window** with three tabs:
   processing steps and one line per table band with time left; it is also saved to
   `sessions/<session>/calibration/calibration_log.txt`. Calibration output is not repeated in
   the pipeline log at the bottom of the window.
-- **2 Capture**: **your camera GUI** (`camera_pythonscripts/gui_test_camera_slm.py`,
+- **2 Capture**: **your camera GUI** (`camera_pythonscripts/camera/gui_test_camera_slm.py`,
   unchanged), with its camera panel, SLM mask-folder tree, Auto Cycle, previews, live views and
   log. A pipeline bar on top has the scene name, exposure, a Blackfly checkbox and
   **Capture scene** (all-zero + 56 masks + all-zero). The Gray-code `patterns` and the
@@ -104,8 +106,8 @@ back the way they were. Don't use its own Capture or Auto Cycle during a pipelin
 Progress and warnings appear in the pipeline log at the bottom of the window.
 
 When run this way, the camera GUI keeps its remembered mask folders and default
-`test_captures/` in `pipeline/labgui_state/`, so nothing in `camera_pythonscripts` is written.
-Starting it the usual way (`python gui_test_camera_slm.py` from its own folder) is unaffected.
+`test_captures/` in `pipeline/labgui_state/`, so nothing in `camera/` is written.
+Starting it on its own (`cd ../camera`, then `python gui_test_camera_slm.py`) is unaffected.
 
 `python pipeline.py gui --standalone` opens the pipeline without your camera GUI. It connects to
 the hardware itself and has its own simple Live tab.

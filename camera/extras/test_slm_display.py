@@ -16,6 +16,11 @@ Run:
     python3 -m unittest test_slm_display.py -v
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # the drivers are in camera/, one folder up
+
+
 import tempfile
 import unittest
 from pathlib import Path

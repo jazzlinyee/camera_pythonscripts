@@ -216,6 +216,16 @@ class App:
             btn = ttk.Button(bar, text="Open", width=6, command=lambda k=key: self._hw_toggle(k))
             btn.pack(side="left", padx=(2, 0))
             self.hw_widgets[key] = (dot, btn)
+            if key == "blackfly":            # its processing switches + what the camera reports
+                self.bf_gamma_var, self.bf_wb_var = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
+                self.bf_gamma_cb = ttk.Checkbutton(bar, text="Gamma", variable=self.bf_gamma_var,
+                                                   command=self._bf_toggle_gamma)
+                self.bf_gamma_cb.pack(side="left", padx=(8, 0))
+                self.bf_wb_cb = ttk.Checkbutton(bar, text="White balance", variable=self.bf_wb_var,
+                                                command=self._bf_toggle_wb)
+                self.bf_wb_cb.pack(side="left", padx=(4, 0))
+                self.bf_status = ttk.Label(bar, text="", foreground=self.C["muted"])
+                self.bf_status.pack(side="left", padx=(6, 0))
         self.hw_all_btn = ttk.Button(bar, text="Open all", command=self._hw_open_all)
         self.hw_all_btn.pack(side="left", padx=(12, 0))
         self.root.after(500, self._hw_refresh)
@@ -253,10 +263,71 @@ class App:
                           state="disabled" if (self.busy or sim) else "normal")
         all_open = all(self._hw_is_open(k) for k, _ in self._HW)
         self.hw_all_btn.configure(state="disabled" if (self.busy or sim or all_open) else "normal")
+        self._bf_refresh()
         try:
             self.root.after(1000, self._hw_refresh)
         except tk.TclError:
             pass
+
+    # ---- Blackfly gamma / white balance (top bar)
+    def _bf_cam(self):
+        cam = self.lab.cams.get("blackfly") if self.lab is not None else None
+        return cam if cam is not None and hasattr(cam, "raw_settings") else None
+
+    @staticmethod
+    def _bf_is_raw(s):
+        ratios_ok = all(not isinstance(s.get(k), (int, float)) or abs(s[k] - 1.0) <= 1e-3
+                        for k in ("BalanceRatio_Red", "BalanceRatio_Blue"))
+        return s.get("GammaEnable") is not True and str(s.get("BalanceWhiteAuto", "Off")) in ("Off", "n/a") and ratios_ok
+
+    def _bf_refresh(self):
+        """Read gamma / white balance back from the Blackfly and show it (about once a second)."""
+        cam = self._bf_cam()
+        usable = cam is not None and not self.busy
+        for cb in (self.bf_gamma_cb, self.bf_wb_cb):
+            cb.state(["!disabled"] if usable else ["disabled"])
+        if cam is None:
+            self.bf_status.configure(text="")
+            return
+        if self.busy:
+            return                          # don't talk to the camera while a capture uses it
+        try:
+            s = cam.raw_settings()
+        except Exception as e:  # noqa
+            self.bf_status.configure(text=f"(can't read settings: {e})", foreground=self.C["warn"])
+            return
+        gamma_on = s.get("GammaEnable") is True
+        wb_on = str(s.get("BalanceWhiteAuto", "Off")) not in ("Off", "n/a")
+        self.bf_gamma_var.set(gamma_on)
+        self.bf_wb_var.set(wb_on)
+        r = lambda k: f"{s[k]:.2f}" if isinstance(s.get(k), (int, float)) else "?"
+        raw = self._bf_is_raw(s)
+        self.bf_status.configure(
+            text=f"camera: gamma {'ON' if gamma_on else 'off'} · WB {'ON' if wb_on else 'off'} · "
+                 f"R {r('BalanceRatio_Red')} B {r('BalanceRatio_Blue')}" + ("" if raw else "  NOT raw"),
+            foreground=self.C["good"] if raw else self.C["warn"])
+
+    def _bf_toggle_gamma(self):
+        cam, on = self._bf_cam(), self.bf_gamma_var.get()
+        try:
+            cam.set_gamma(on)
+            self.log(f"Blackfly gamma correction {'ON - frames are not raw' if on else 'off (raw)'}.",
+                     "warn" if on else "ok")
+        except Exception as e:  # noqa
+            self.bf_gamma_var.set(not on)
+            messagebox.showinfo("Blackfly", f"Could not change gamma: {e}")
+        self._bf_refresh()
+
+    def _bf_toggle_wb(self):
+        cam, on = self._bf_cam(), self.bf_wb_var.get()
+        try:
+            note = cam.set_white_balance(on)
+            self.log(f"Blackfly white balance {'ON (automatic) - frames are not raw' if on else 'off (raw)'}: {note}.",
+                     "warn" if on else "ok")
+        except Exception as e:  # noqa
+            self.bf_wb_var.set(not on)
+            messagebox.showinfo("Blackfly", f"Could not change white balance: {e}")
+        self._bf_refresh()
 
     def _hw_toggle(self, key):
         if self.busy:

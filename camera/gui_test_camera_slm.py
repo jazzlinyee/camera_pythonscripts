@@ -899,6 +899,28 @@ class App:
             n += 1
         return path
 
+    def _record_blackfly_settings(self, cam, saved: Path):
+        """Note the Blackfly's processing settings (read back from the camera) for this
+        capture in blackfly_settings.json next to it, so it is clear afterwards whether
+        gamma / white balance were off (added 2026-10-29). Never stops a capture."""
+        if not hasattr(cam, "raw_settings"):
+            return
+        try:
+            settings = cam.raw_settings()
+            settings["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            path = saved.parent / "blackfly_settings.json"
+            record = json.loads(path.read_text()) if path.is_file() else {}
+            record[saved.name] = settings
+            path.write_text(json.dumps(record, indent=2, default=str))
+            processed = (settings.get("GammaEnable") is True
+                         or str(settings.get("BalanceWhiteAuto", "Off")) not in ("Off", "n/a")
+                         or any(isinstance(settings.get(k), (int, float)) and abs(settings[k] - 1.0) > 1e-3
+                                for k in ("BalanceRatio_Red", "BalanceRatio_Blue")))
+            if processed:
+                self.log(f"NOTE: {saved.name} was taken with gamma or white balance ON (see blackfly_settings.json).")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"(could not record Blackfly settings: {e})")
+
     def capture(self, extra=""):
         self._capture_one(self.cam_choice.get(), extra=extra)
 
@@ -934,6 +956,8 @@ class App:
 
         self.shots[choice] += 1
         self.log(f"Saved {saved}")
+        if choice == "blackfly":
+            self._record_blackfly_settings(cam, Path(saved))
 
         img = cv2.imread(str(saved), cv2.IMREAD_UNCHANGED)
         if img is None:

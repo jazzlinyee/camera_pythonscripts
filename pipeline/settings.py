@@ -33,7 +33,7 @@ DEFAULTS = {
         # camera_pythonscripts:  <lab>/camera_pythonscripts/pipeline   <lab>/calibration
         # The scan masks are kept inside the pipeline (masks/scan_masks, in git).
         "calibration_code": "../../calibration",
-        "camera_code": "..",
+        "camera_code": "../camera",       # drivers + camera GUI (camera_pythonscripts/camera/)
         "scan_masks": "masks/scan_masks",
         "patterns": "../../calibration/patterns",
     },
@@ -86,7 +86,7 @@ def _merge(base, extra):
 
 # Defaults from before the pipeline moved into camera_pythonscripts/ (sessions made then
 # stored these in session.json); they are swapped for the current defaults on load.
-_OLD_LAB_DEFAULTS = {"calibration_code": ["../calibration"], "camera_code": ["../camera_pythonscripts"],
+_OLD_LAB_DEFAULTS = {"calibration_code": ["../calibration"], "camera_code": ["../camera_pythonscripts", ".."],
                      "scan_masks": ["../slm_scan/scan_masks", "../../slm_scan/scan_masks"],
                      "patterns": ["../calibration/patterns"]}
 

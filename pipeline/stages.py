@@ -423,6 +423,14 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
                                 "blackfly": (cap / "rgb" / f"rgb_{r['frame']:02d}.png") if bf else None}))
     if s["capture"]["zero_at_end"]:
         shots.append(dict(mask_index=0, save={"basler": cap / "zero_end.tiff"}, fmt="raw16", group="scene", exposure=exp))
+    bf_settings = None                      # what the Blackfly reports (gamma / white balance)
+    if bf and getattr(rig, "blackfly", None) is not None and hasattr(rig.blackfly, "raw_settings"):
+        try:
+            bf_settings = json.loads(json.dumps(rig.blackfly.raw_settings(), default=str))
+            if bf_settings.get("GammaEnable") is True or str(bf_settings.get("BalanceWhiteAuto", "Off")) not in ("Off", "n/a"):
+                log("WARNING: Blackfly gamma or white balance is ON - its frames will not be raw.")
+        except Exception as e:  # noqa
+            bf_settings = {"error": str(e)}
     log(f"Scene capture '{scene}': {len(shots)} frames at {exp:.0f} us. Keep the scene completely still.")
     t0 = time.time()
     run_shots(rig, shots, ui, log)
@@ -442,7 +450,7 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
         "exposure_us": exp, "settle_ms": s["settle_ms"], "pixel_values": "raw 12-bit (0-4095) in uint16 TIFF",
         "table": str(session.table), "table_md5": _md5(session.table) if session.table.is_file() else None,
         "zero_frames": [n for n in ("zero_start.tiff", "zero_end.tiff") if (cap / n).is_file()],
-        "zero_drift": drift, "blackfly": bool(bf),
+        "zero_drift": drift, "blackfly": bool(bf), "blackfly_settings": bf_settings,
         "frames": [{"frame": r["frame"], "dy": r["dy"], "dx": r["dx"], "mask": f"masks/{Path(r['mask']).name}",
                     "capture": f"captures/scan_{r['frame']:02d}.tiff"} for r in plan],
         "saturated_frames": [Path(x["save"]["basler"]).name for x in shots if x["saturated"] > 0.001],
