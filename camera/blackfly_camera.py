@@ -97,7 +97,7 @@ class BlackflyCamera(Camera):
         serial: Optional[str] = None,
         name: str = "BFS-U3-16S2C",
         exposure_us: Optional[float] = None,
-        gain_db: Optional[float] = None,
+        gain_db: Optional[float] = 0.0,
     ):
         """Configure (but don't yet connect to) a Blackfly camera.
 
@@ -112,7 +112,9 @@ class BlackflyCamera(Camera):
                 set_exposure_time() later to switch to manual. Either way,
                 set_exposure_time() can change it again at any point after
                 open().
-            gain_db: Manual gain in dB. If None, auto-gain is left on.
+            gain_db: Manual gain in dB (default 0 dB). Auto-gain is always
+                turned off so frame brightness only depends on the exposure;
+                None also means 0 dB.
 
         Raises:
             CameraError: if PySpin isn't installed.
@@ -210,9 +212,9 @@ class BlackflyCamera(Camera):
             self._cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
             self._cam.ExposureTime.SetValue(self.exposure_us)
 
-        if self.gain_db is not None:
-            self._cam.GainAuto.SetValue(PySpin.GainAuto_Off)
-            self._cam.Gain.SetValue(self.gain_db)
+        # Auto-gain always off (it would change brightness between frames).
+        self._cam.GainAuto.SetValue(PySpin.GainAuto_Off)
+        self._cam.Gain.SetValue(0.0 if self.gain_db is None else self.gain_db)
 
     def start(self) -> None:
         """Begin acquisition ("turn on"). Must be called after open().

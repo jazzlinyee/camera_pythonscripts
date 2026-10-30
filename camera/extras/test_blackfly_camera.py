@@ -178,10 +178,19 @@ class BlackflyCameraTests(unittest.TestCase):
         self.fake_cam.GainAuto.SetValue.assert_called_once_with("GainAuto_Off")
         self.fake_cam.Gain.SetValue.assert_called_once_with(3.5)
 
-    def test_configure_skips_exposure_gain_when_not_given(self):
+    def test_configure_skips_exposure_when_not_given(self):
         self._open_camera()
         self.fake_cam.ExposureAuto.SetValue.assert_not_called()
-        self.fake_cam.GainAuto.SetValue.assert_not_called()
+
+    def test_configure_turns_auto_gain_off_by_default(self):
+        self._open_camera()
+        self.fake_cam.GainAuto.SetValue.assert_called_once_with("GainAuto_Off")
+        self.fake_cam.Gain.SetValue.assert_called_once_with(0.0)
+
+    def test_configure_gain_none_means_zero_db(self):
+        self._open_camera(gain_db=None)
+        self.fake_cam.GainAuto.SetValue.assert_called_once_with("GainAuto_Off")
+        self.fake_cam.Gain.SetValue.assert_called_once_with(0.0)
 
     # -- start() / stop() ------------------------------------------------
 
