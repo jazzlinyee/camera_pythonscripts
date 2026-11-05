@@ -109,6 +109,13 @@ class Session:
             if self.settings["lab"].get(k) in old:
                 self.settings["lab"][k] = DEFAULTS["lab"][k]
 
+    def reload(self):
+        """Re-read session.json (picks up edits made in a text editor)."""
+        try:
+            self.settings = _merge(DEFAULTS, self._read())
+        except (OSError, ValueError):
+            pass   # unreadable file: keep the current settings
+
     # ---------------------------------------------------------------- settings
     def _read(self):
         if self.settings_path.is_file():

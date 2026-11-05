@@ -1131,6 +1131,7 @@ class App:
         self.log(f"Edit {p}, then re-select the session to reload it.")
 
     def save_form(self):
+        self.session.reload()   # keep edits made to session.json by hand
         s = self.session.settings
         try:
             for (folder, nm_var, exp_var, _), laser in zip(self.laser_rows, s["calibration"]["lasers"]):
