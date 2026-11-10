@@ -7,6 +7,7 @@ RealRig drives the lab hardware through the lab's own camera_pythonscripts class
 Interface used by the stages and the GUI:
     rig.open(blackfly=True)          rig.close()
     rig.load_masks([arrays...])      rig.show(i)          # SLM; call from the main (Tk) thread
+    rig.flip_x                       # True when masks are shown flipped left-right
     rig.set_exposure(us)             rig.exposure_us
     rig.grab_basler()  -> uint16 raw 12-bit frame taken entirely AFTER the last show()
     rig.grab_blackfly()-> raw Bayer (RG) uint8 frame, same guarantee
@@ -84,7 +85,8 @@ class RealRig(_Base):
         slm_mod = self.mods["slm_display"]
         black = np.zeros((1080, 1920), np.uint8)
         self.slm = slm_mod.SLMDisplay([black], monitor_index=s["slm"]["monitor_index"],
-                                      mirrored=s["slm"]["mirrored"], master=self.tk_master)
+                                      mirrored=s["slm"]["mirrored"], master=self.tk_master,
+                                      flip_x=bool(s["slm"].get("flip_x", True)))
         self.slm.open()
         self.log("SLM open.")
         B = self.mods["basler_camera"].BaslerCamera
@@ -116,6 +118,10 @@ class RealRig(_Base):
         self.slm = self.basler = self.blackfly = None
 
     # ------------------------------------------------------------- SLM
+    @property
+    def flip_x(self):
+        return bool(getattr(self.slm, "flip_x", False))
+
     def load_masks(self, masks):
         self.slm.set_masks([np.ascontiguousarray(m, dtype=np.uint8) for m in masks])
 
@@ -175,6 +181,11 @@ class LabGuiRig(_Base):
     @property
     def blackfly(self):
         return self.lab.cams.get("blackfly")
+
+    @property
+    def flip_x(self):
+        """The camera GUI's SLM flip (its "Flip masks left-right" checkbox)."""
+        return bool(getattr(self.lab.slm, "flip_x", False))
 
     def problems(self):
         p = []
@@ -243,7 +254,8 @@ class LabGuiRig(_Base):
         self._t_show = time.time()
         try:
             w, h = self.lab.preview_sizes["mask"]
-            ph = self.labmod.array_to_photoimage(self._masks[i], w, h)
+            m = self._masks[i]
+            ph = self.labmod.array_to_photoimage(m[:, ::-1] if self.flip_x else m, w, h)
             self.lab._mask_thumb_photo = ph
             self.lab.mask_preview_label.configure(image=ph)
         except Exception:

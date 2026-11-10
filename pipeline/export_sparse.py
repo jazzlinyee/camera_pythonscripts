@@ -175,7 +175,8 @@ def _jobs_from_positions(scenes):
             jobs.append(dict(name=f"{sd.name}_{p.name}", basler=p / "mask.tiff",
                              blackfly=(p / "rgb.png") if (p / "rgb.png").is_file() else None,
                              zero=(p / "zero.tiff") if (p / "zero.tiff").is_file() else None,
-                             mask=rec.get("mask_file"), folder=p, scale=rec.get("pixel_scale", 1)))
+                             mask=(p / "slm_mask.png") if (p / "slm_mask.png").is_file() else rec.get("mask_file"),
+                             folder=p, scale=rec.get("pixel_scale", 1)))
     return jobs
 
 

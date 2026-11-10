@@ -87,7 +87,7 @@ class BaslerCamera(Camera):
         serial: Optional[str] = None,
         name: str = "acA5472-17um",
         exposure_us: Optional[float] = None,
-        gain_db: Optional[float] = None,
+        gain_db: Optional[float] = 0.0,
     ):
         """Configure (but don't yet connect to) a Basler camera.
 
@@ -101,7 +101,9 @@ class BaslerCamera(Camera):
                 set_exposure_time() later to switch to manual. Either way,
                 set_exposure_time() can change it again at any point after
                 open().
-            gain_db: Manual gain in dB. If None, auto-gain is left on.
+            gain_db: Manual gain in dB (default 0 dB). Auto-gain is always
+                turned off at open() so frame brightness only depends on the
+                exposure (2026-11-06); None also means 0 dB.
 
         Raises:
             CameraError: if pypylon isn't installed.
@@ -112,6 +114,8 @@ class BaslerCamera(Camera):
         self.serial = serial
         self.exposure_us = exposure_us
         self.gain_db = gain_db
+        self.gain_note = ""
+        self.roi_note = ""
         self._cam = None
         self._converter = None
 
@@ -176,11 +180,85 @@ class BaslerCamera(Camera):
             if self.exposure_us is not None:
                 self._cam.ExposureAuto.SetValue("Off")
                 self._cam.ExposureTime.SetValue(self.exposure_us)
-            if self.gain_db is not None:
-                self._cam.GainAuto.SetValue("Off")
-                self._cam.Gain.SetValue(self.gain_db)
         except genicam.GenericException as e:
             raise CameraError(f"Failed to configure camera: {e}") from e
+
+        # Auto-gain always off, fixed gain (2026-11-06). Done separately so a camera that
+        # names its gain differently still opens; what happened is kept in gain_note and
+        # shows up in raw_settings().
+        gain = 0.0 if self.gain_db is None else self.gain_db
+        notes = []
+        try:
+            self._cam.GainAuto.SetValue("Off")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"could not turn GainAuto off: {e}")
+        try:
+            self._cam.Gain.SetValue(gain)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"could not set Gain to {gain} dB: {e}")
+        self.gain_note = "; ".join(notes)
+        self.roi_note = self._set_full_sensor()
+
+    def _set_full_sensor(self) -> str:
+        """No image offset (added 2026-11-10): binning 1x1, OffsetX/OffsetY 0 and the full
+        sensor width/height, every time the camera opens. Offsets go first because the
+        largest allowed width/height depends on them. Returns a note about anything the
+        camera refused (empty when all went well); never stops open()."""
+        cam, notes = self._cam, []
+
+        def try_set(name, value_fn):
+            try:
+                node = getattr(cam, name)
+            except Exception:  # noqa: BLE001 - this camera has no such setting
+                return
+            try:
+                node.SetValue(value_fn(node))
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"{name}: {e}")
+
+        try_set("CenterX", lambda n: False)               # Basler: auto-centering would move the offset
+        try_set("CenterY", lambda n: False)
+        try_set("BinningHorizontal", lambda n: 1)
+        try_set("BinningVertical", lambda n: 1)
+        try_set("OffsetX", lambda n: 0)
+        try_set("OffsetY", lambda n: 0)
+        try_set("Width", lambda n: n.GetMax())
+        try_set("Height", lambda n: n.GetMax())
+        return "; ".join(notes)
+
+    def raw_settings(self) -> dict:
+        """Read back the camera's current settings (added 2026-11-06): model, serial,
+        pixel format, exposure, gain (auto + value), black level, gamma, frame rate,
+        image size/offset, binning, flips and sensor temperature, plus how the TIFFs are
+        saved. Values this camera doesn't expose come back as 'n/a'."""
+        if not self._is_open:
+            raise CameraError("Camera is not open. Call open() first.")
+        cam = self._cam
+
+        def value(name):
+            try:
+                return getattr(cam, name).GetValue()
+            except Exception:  # noqa: BLE001
+                return "n/a"
+
+        out = {}
+        try:
+            info = cam.GetDeviceInfo()
+            out["Model"] = info.GetModelName()
+            out["Serial"] = info.GetSerialNumber()
+        except Exception:  # noqa: BLE001
+            out["Model"] = out["Serial"] = "n/a"
+        for key in ("PixelFormat", "ExposureTime", "ExposureAuto", "Gain", "GainAuto",
+                    "BlackLevel", "GammaEnable", "Gamma",
+                    "AcquisitionFrameRateEnable", "AcquisitionFrameRate", "ResultingFrameRate",
+                    "Width", "Height", "OffsetX", "OffsetY",
+                    "BinningHorizontal", "BinningVertical", "ReverseX", "ReverseY",
+                    "DeviceTemperature"):
+            out[key] = value(key)
+        out["SavedAs"] = ("12-bit value x16 (MSB-aligned) in a 16-bit TIFF" if MSB_ALIGN_OUTPUT
+                          else "raw 12-bit value (0-4095) in a 16-bit TIFF")
+        out["note"] = "; ".join(n for n in (self.gain_note, self.roi_note) if n)
+        return out
 
     def start(self) -> None:
         """Begin grabbing ("turn on"). Must be called after open().

@@ -120,6 +120,12 @@ from test_on_hardware_slm import HEIGHT, WIDTH, make_test_masks
 # pipeline) can check this flag instead of adding its own white mask.
 SLM_OPENS_WHITE = True
 
+# Every mask is shown flipped left-right on the SLM (added 2026-11-10). The mask files are
+# not changed; only what goes on the SLM is. The "Flip masks left-right" checkbox in the
+# SLM panel turns it off/on. Saved mask copies (capture_masks.json) are the flipped
+# version, i.e. exactly what was on the SLM.
+SLM_FLIP_X = True
+
 OUTPUT_DIR = Path("test_captures")
 # Characters that can't safely appear in a file name on macOS/Windows/Linux --
 # replaced with "_" when cleaning a user-typed capture name.
@@ -187,6 +193,7 @@ class App:
         self.masks = []
         self.mask_names = []
         self.mask_folders = []  # parallel to masks/mask_names: which folder label each came from
+        self.mask_paths = []    # parallel too: the file each mask was read from
 
         # Two independent camera slots (not just "the current one") so
         # both can be open at once -- needed for Capture Both. Which one
@@ -351,6 +358,12 @@ class App:
         tree_scroll.pack(side="right", fill="y")
         self.mask_tree.configure(yscrollcommand=tree_scroll.set)
         self.mask_tree.bind("<Double-Button-1>", self._on_mask_tree_double_click)
+
+        self.slm_flip_var = tk.BooleanVar(value=SLM_FLIP_X)
+        ttk.Checkbutton(
+            slm_frame, text="Flip masks left-right (all masks, as shown on the SLM)",
+            variable=self.slm_flip_var, command=self._on_slm_flip_toggle,
+        ).grid(row=2, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 4))
 
         auto_wrap = ttk.Frame(self.top_section)
         auto_wrap.grid(row=0, column=2, sticky="nsew", **pad)
@@ -666,7 +679,7 @@ class App:
             w, h = self.preview_sizes["mask"]
             idx = self._current_mask_index
             if idx is not None and idx < len(self.masks):
-                self._mask_thumb_photo = array_to_photoimage(self.masks[idx], w, h)
+                self._mask_thumb_photo = array_to_photoimage(self._as_shown(self.masks[idx]), w, h)
                 self.mask_preview_label.configure(image=self._mask_thumb_photo)
             elif getattr(self, "_showing_white", False) and self.slm is not None:
                 white = np.full((h, w), 255, dtype=np.uint8)
@@ -921,6 +934,76 @@ class App:
         except Exception as e:  # noqa: BLE001
             self.log(f"(could not record Blackfly settings: {e})")
 
+    def _mask_on_slm(self):
+        """(name, image, source info) of the pattern on the SLM right now, or None when
+        the SLM is closed or what it shows isn't known."""
+        if self.slm is None:
+            return None
+        if getattr(self, "_showing_white", False):
+            return ("white", np.full((HEIGHT, WIDTH), 255, dtype=np.uint8),
+                    {"source": "white (SLM default)", "flipped_x": bool(self.slm_flip_var.get())})
+        i = self._current_mask_index
+        if i is None or i >= len(self.masks):
+            return None
+        info = {"folder": self.mask_folders[i] if i < len(self.mask_folders) else "",
+                "source": str(self.mask_paths[i]) if i < len(self.mask_paths) else "",
+                "flipped_x": bool(self.slm_flip_var.get())}
+        return (self.mask_names[i], self._as_shown(self.masks[i]), info)
+
+    def _record_capture_mask(self, saved: Path, on_slm):
+        """Save the SLM pattern used for this photo next to it (added 2026-11-06): each
+        distinct mask once, as <mask name>.png (_2, _3, ... if a different mask has the same
+        name), and capture_masks.json mapping every photo to its mask file. Never stops a
+        capture. With the left-right flip on, the copy is the flipped image actually shown,
+        saved as <mask name>_flipped.png (2026-11-10)."""
+        try:
+            path = saved.parent / "capture_masks.json"
+            record = json.loads(path.read_text()) if path.is_file() else {}
+            record.setdefault("masks", {})
+            record.setdefault("captures", {})
+            entry = {"time": time.strftime("%Y-%m-%d %H:%M:%S")}
+            if on_slm is None:
+                entry["mask"] = None
+                entry["note"] = "SLM closed" if self.slm is None else "pattern on the SLM unknown"
+            else:
+                name, img, info = on_slm
+                stem = self._clean_filename(name) or "mask"
+                if info.get("flipped_x") and name != "white":
+                    stem += "_flipped"              # not the same image as the original file
+                mask_file, n = f"{stem}.png", 2
+                while (saved.parent / mask_file).exists():
+                    old = cv2.imread(str(saved.parent / mask_file), cv2.IMREAD_GRAYSCALE)
+                    if old is not None and old.shape == img.shape and np.array_equal(old, img):
+                        break                       # same mask already saved here
+                    mask_file, n = f"{stem}_{n}.png", n + 1
+                else:
+                    cv2.imwrite(str(saved.parent / mask_file), img)
+                    self.log(f"Saved the SLM mask as {mask_file}")
+                record["masks"].setdefault(mask_file, info)
+                entry["mask"] = mask_file
+            record["captures"][saved.name] = entry
+            path.write_text(json.dumps(record, indent=2))
+        except Exception as e:  # noqa: BLE001
+            self.log(f"(could not save the SLM mask for {saved.name}: {e})")
+
+    def _record_basler_settings(self, cam, saved: Path):
+        """Note the Basler's settings (read back from the camera) for this capture in
+        basler_settings.json next to it (added 2026-11-06). Never stops a capture."""
+        if not hasattr(cam, "raw_settings"):
+            return
+        try:
+            settings = cam.raw_settings()
+            settings["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            path = saved.parent / "basler_settings.json"
+            record = json.loads(path.read_text()) if path.is_file() else {}
+            record[saved.name] = settings
+            path.write_text(json.dumps(record, indent=2, default=str))
+            for key in ("GainAuto", "ExposureAuto"):
+                if str(settings.get(key, "Off")) not in ("Off", "n/a"):
+                    self.log(f"NOTE: {saved.name} was taken with Basler {key} = {settings[key]}.")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"(could not record Basler settings: {e})")
+
     def capture(self, extra=""):
         self._capture_one(self.cam_choice.get(), extra=extra)
 
@@ -948,6 +1031,7 @@ class App:
         except OSError as e:
             self.log(f"Can't use the save folder '{self.save_dir}': {e}")
             return None
+        on_slm = self._mask_on_slm()   # what the SLM shows for this photo
         try:
             saved = cam.capture(path)
         except CameraError as e:
@@ -958,6 +1042,9 @@ class App:
         self.log(f"Saved {saved}")
         if choice == "blackfly":
             self._record_blackfly_settings(cam, Path(saved))
+        else:
+            self._record_basler_settings(cam, Path(saved))
+        self._record_capture_mask(Path(saved), on_slm)
 
         img = cv2.imread(str(saved), cv2.IMREAD_UNCHANGED)
         if img is None:
@@ -1060,14 +1147,16 @@ class App:
         # show_mask(i) still shows the i-th loaded mask. Works with no masks loaded too.
         white = np.full((HEIGHT, WIDTH), 255, dtype=np.uint8)
         try:
-            self.slm = SLMDisplay(list(self.masks) + [white], mirrored=self.mirrored, master=self.root)
+            self.slm = SLMDisplay(list(self.masks) + [white], mirrored=self.mirrored, master=self.root,
+                                  flip_x=self.slm_flip_var.get())
             self.slm.open()
         except SLMError as e:
             self.log(f"Failed to open SLM display: {e}")
             self.slm = None
             return
 
-        self.log("SLM display opened -- check it landed on the SLM's screen.")
+        self.log("SLM display opened -- check it landed on the SLM's screen."
+                 + (" Masks are shown flipped left-right." if self.slm_flip_var.get() else ""))
         self.open_slm_btn.configure(state="disabled")
         self.close_slm_btn.configure(state="normal")
         self.show_white()
@@ -1089,6 +1178,20 @@ class App:
         self._showing_white = True
         self._mask_thumb_photo = array_to_photoimage(white, *self.preview_sizes["mask"])
         self.mask_preview_label.configure(image=self._mask_thumb_photo)
+
+    def _as_shown(self, mask):
+        """`mask` as it appears on the SLM (flipped left-right when the flip is on)."""
+        return np.ascontiguousarray(mask[:, ::-1]) if self.slm_flip_var.get() else mask
+
+    def _on_slm_flip_toggle(self):
+        on = bool(self.slm_flip_var.get())
+        if self.slm is not None and hasattr(self.slm, "set_flip_x"):
+            try:
+                self.slm.set_flip_x(on)
+            except SLMError as e:
+                self.log(f"Could not change the flip: {e}")
+        self.log("Masks are now shown " + ("FLIPPED left-right." if on else "as they are (not flipped)."))
+        self._render_previews(["mask"])
 
     def close_slm(self):
         if self.slm is None:
@@ -1117,7 +1220,7 @@ class App:
         self._current_mask_index = index
         self._showing_white = False
         self._mask_thumb_photo = array_to_photoimage(
-            self.masks[index], *self.preview_sizes["mask"]
+            self._as_shown(self.masks[index]), *self.preview_sizes["mask"]
         )
         self.mask_preview_label.configure(image=self._mask_thumb_photo)
 
@@ -1286,7 +1389,7 @@ class App:
         (logged, not fatal to the rest of the scan) rather than resized,
         so a hard-edged amplitude mask never gets blurred into
         intermediate gray values that aren't a real amplitude level."""
-        masks, names, folders = [], [], []
+        masks, names, folders, paths_out = [], [], [], []
         want_w, want_h = MASK_EXPECTED_SIZE
 
         for folder_path, label in self.mask_root_folders:
@@ -1306,10 +1409,12 @@ class App:
                 masks.append(mask)
                 names.append(path.stem)
                 folders.append(label)
+                paths_out.append(path)
 
         self.masks = masks
         self.mask_names = names
         self.mask_folders = folders
+        self.mask_paths = paths_out
 
     def _refresh_folder_choices(self):
         """Recompute the distinct folder labels for Auto Cycle's "Loop

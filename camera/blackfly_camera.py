@@ -208,6 +208,10 @@ class BlackflyCamera(Camera):
             # sensor can hand back. Must be set before BeginAcquisition().
             self._cam.PixelFormat.SetValue(PySpin.PixelFormat_BayerRG8)
 
+        # No image offset: full sensor, offset 0, no binning (2026-11-10). Before
+        # BeginAcquisition(), after the pixel format.
+        self.roi_note = self._set_full_sensor()
+
         if self.exposure_us is not None:
             self._cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
             self._cam.ExposureTime.SetValue(self.exposure_us)
@@ -265,6 +269,33 @@ class BlackflyCamera(Camera):
         except Exception as e:  # noqa: BLE001 - keep open() working on any firmware
             return f"could not set BalanceRatio ({e})"
 
+    def _set_full_sensor(self) -> str:
+        """No image offset (added 2026-11-10): binning 1x1, OffsetX/OffsetY 0 and the full
+        sensor width/height, every time the camera opens. Offsets go first because the
+        largest allowed width/height depends on them. Returns a note about anything the
+        camera refused (empty when all went well); never stops open()."""
+        cam, notes = self._cam, []
+
+        def try_set(name, value_fn):
+            try:
+                node = getattr(cam, name)
+            except Exception:  # noqa: BLE001 - this camera has no such setting
+                return
+            try:
+                node.SetValue(value_fn(node))
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"{name}: {e}")
+
+        try_set("CenterX", lambda n: False)               # Basler: auto-centering would move the offset
+        try_set("CenterY", lambda n: False)
+        try_set("BinningHorizontal", lambda n: 1)
+        try_set("BinningVertical", lambda n: 1)
+        try_set("OffsetX", lambda n: 0)
+        try_set("OffsetY", lambda n: 0)
+        try_set("Width", lambda n: n.GetMax())
+        try_set("Height", lambda n: n.GetMax())
+        return "; ".join(notes)
+
     def raw_settings(self) -> dict:
         """Read back the camera settings that decide whether frames are raw:
         pixel format, gamma, white balance (auto + both ratios), ISP and ADC depth.
@@ -299,7 +330,11 @@ class BlackflyCamera(Camera):
         for key in ("IspEnable", "AdcBitDepth", "BlackLevel", "ExposureAuto", "GainAuto", "Gain"):
             node = getattr(cam, key, None)
             out[key] = "n/a" if node is None else (value(node) if key in ("IspEnable", "BlackLevel", "Gain") else enum(node))
-        out["note"] = getattr(self, "balance_ratio_note", "")
+        for key in ("Width", "Height", "OffsetX", "OffsetY", "BinningHorizontal", "BinningVertical"):
+            node = getattr(cam, key, None)
+            out[key] = "n/a" if node is None else value(node)
+        out["note"] = "; ".join(n for n in (getattr(self, "balance_ratio_note", ""),
+                                            getattr(self, "roi_note", "")) if n)
         return out
 
     def set_gamma(self, on: bool) -> None:

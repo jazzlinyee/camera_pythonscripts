@@ -42,7 +42,9 @@ DEFAULTS = {
     # Python used for processing (notebooks need opencv-contrib, scipy, nbclient, ipykernel).
     # Blank = the same Python that is running the pipeline.
     "processing_python": "",
-    "slm": {"monitor_index": None, "mirrored": False},
+    # flip_x: every mask is shown flipped left-right on the SLM (2026-11-10). In the GUI this
+    # follows the "Flip masks" checkbox (top bar / camera GUI's SLM panel).
+    "slm": {"monitor_index": None, "mirrored": False, "flip_x": True},
     "basler": {"serial": None, "gain_db": 0.0},
     "blackfly": {"enabled": True, "serial": None, "gain_db": 0.0, "exposure_us": 20000},
     # Time to wait after changing the SLM image before grabbing (one stale frame is

@@ -134,7 +134,9 @@ frame, back to back, instead of a full scan. On the **2 Capture** tab, row **Mov
 2. **Capture position (mask + black)**: shows the mask and takes a Basler + Blackfly frame,
    then shows black and takes a Basler frame. Saved in
    `scenes/<scene>/positions/pos_NN/`: `mask.tiff`, `zero.tiff` (raw 12-bit), `rgb.png` + `rgb.raw`,
-   and `position.json` (exposure, mask, Blackfly settings, brightness, saturation).
+   the SLM patterns used (`slm_mask.png` for `mask.tiff`, `slm_black.png` for `zero.tiff`; the
+   export uses this copy of the mask), and `position.json` (exposure, mask, Blackfly settings,
+   brightness, saturation).
 3. Move the object, press **Capture position** again, and so on.
 4. **Export positions**: sparse cube + RGB on SLM coordinates for every position, each with its
    own black frame subtracted -> `scenes/<scene>/sparse_export/<scene>_pos_NN.npz` (same format as
@@ -209,6 +211,36 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
   (1080 x 1440 uint8, row by row, like the lab's `img_rgb.raw`; read it with
   `np.fromfile(path, np.uint8).reshape(1080, 1440)`). Their settings are recorded in the scene's
   `manifest.json` (pipeline) or `blackfly_settings.json` (camera GUI captures).
+- **Basler settings saved with captures.** The Basler's settings are read back from the camera
+  (model, serial, pixel format, exposure, gain + auto gain, black level, gamma, frame rate,
+  image size/offset, binning, flips, temperature, how the TIFF is scaled) and saved with every
+  capture: `basler_settings.json` next to camera GUI photos (one entry per photo), and
+  `"basler_settings"` in `manifest.json` (Capture scene), `position.json` (Capture position) and
+  each laser in `calibration/capture.json`. Auto gain is always off on both cameras (gain 0 dB),
+  so frame brightness depends only on the exposure; a warning appears if a camera reports
+  auto gain or auto exposure on.
+- **Masks are flipped left-right on the SLM** (since 2026-11-10). Every mask is shown flipped:
+  Gray codes, scan masks, the sparse mask, white/black, and anything shown from the camera GUI.
+  The mask files themselves are not changed. Switch: **Flip masks ↔** in the top bar (or the
+  checkbox under the camera GUI's mask list; the two follow each other), saved as
+  `"slm": {"flip_x": true}` in session.json. Everything saved with a capture is the mask *as
+  shown*: a scene's `masks/` folder holds the flipped copies (so Make cube and the orientation
+  check use exactly what was on the SLM), positions' `slm_mask.png` / `slm_black.png` too, and
+  camera GUI copies are named `<mask>_flipped.png`. `manifest.json` / `position.json` /
+  `capture_masks.json` / `check/scale.json` record `masks_flipped_x`. Gray codes are flipped once
+  (never twice) and the table is un-flipped as before, so it stays in real SLM columns. The
+  older calibration-only switch (`flip_patterns_x`, Calibrate tab) only matters with the flip off.
+- **No image offset.** Every time the Basler or Blackfly opens, it is set to the full sensor:
+  OffsetX/OffsetY 0, binning 1x1, maximum width/height (Basler 5472 x 3648, Blackfly 1440 x 1080;
+  Basler auto-centering off). Captures were already full-sensor, so existing calibrations are
+  unaffected. The values are read back into `basler_settings.json` / `blackfly_settings.json`; a
+  setting the camera refuses is listed in their `note`.
+- **Masks saved with captures.** Every photo taken with the camera GUI's Capture, Capture Both
+  or Auto Cycle also saves the SLM pattern it was taken with into the same folder (each distinct
+  mask once, under its own name, e.g. `mask_00.png`; the white default as `white.png`), and
+  `capture_masks.json` there says which mask each photo used. Moving-object positions save
+  theirs too (above). Not done for calibration captures (the patterns are in
+  `calibration/patterns/`) or Capture scene (its masks are already in `scenes/<scene>/masks/`).
 - **QE correction.** `meas2hyper.ipynb` multiplies by the QE curve, and the pipeline runs it
   as written. If the lab changes this, the pipeline picks up the change automatically.
 - **Gray-code patterns** are read from `calibration/patterns/` (made by graycode.ipynb's first cell).

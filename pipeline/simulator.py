@@ -79,7 +79,8 @@ class SimRig:
         self.log = log
         sim = session.settings.get("sim", {})
         self.optics = Optics(scale=sim.get("scale", 0.6))
-        self.flip = bool(sim.get("flip_slm_x", False))
+        self.flip = bool(sim.get("flip_slm_x", False))      # simulates a mirrored optical path
+        self.flip_x = bool(session.settings.get("slm", {}).get("flip_x", False))   # software flip, like the SLM's
         self.noise = float(sim.get("noise", 4.0))
         self.scene = Scene()
         self.masks, self.cur = [np.zeros((SLM_H, SLM_W), np.uint8)], 0
@@ -97,7 +98,7 @@ class SimRig:
         pass
 
     def load_masks(self, masks):
-        self.masks = [np.asarray(m) for m in masks]
+        self.masks = [np.asarray(m)[:, ::-1] if self.flip_x else np.asarray(m) for m in masks]
         self.cur = 0
         self._cache = None
 

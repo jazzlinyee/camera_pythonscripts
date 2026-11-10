@@ -124,6 +124,16 @@ def _black():
     return np.zeros((1080, 1920), np.uint8)
 
 
+def rig_flip(rig):
+    """True when the rig shows every mask flipped left-right (slm flip_x, 2026-11-10)."""
+    return bool(getattr(rig, "flip_x", False))
+
+
+def as_shown(mask, flip):
+    """The mask as it appears on the SLM."""
+    return np.ascontiguousarray(mask[:, ::-1]) if flip else mask
+
+
 # =============================================================== shot runner
 def run_shots(rig, shots, ui, log):
     """shots: list of dicts {mask_index, save: {basler: path, blackfly: path|None}, fmt, group, exposure, light}"""
@@ -139,6 +149,22 @@ def run_shots(rig, shots, ui, log):
 def _fmt_dur(s):
     s = int(round(s))
     return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def basler_settings(rig, log=print):
+    """The Basler's settings read back from the camera (2026-11-06), or None when the rig
+    has no real Basler (simulator). Warns when auto gain or auto exposure is on."""
+    cam = getattr(rig, "basler", None)
+    if cam is None or not hasattr(cam, "raw_settings"):
+        return None
+    try:
+        st = json.loads(json.dumps(cam.raw_settings(), default=str))
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+    for key in ("GainAuto", "ExposureAuto"):
+        if str(st.get(key, "Off")) not in ("Off", "n/a"):
+            log(f"WARNING: Basler {key} is {st[key]} - frame brightness will not be fixed.")
+    return st
 
 
 def _run_shots(rig, shots, ui, log):
@@ -173,6 +199,8 @@ def _run_shots(rig, shots, ui, log):
             cv2.imwrite(str(out), (np.clip(raw, 0, 4095).astype(np.uint16) << 4))   # x16, see PIXEL_SCALE
         sat = saturation_fraction(raw)
         shot["saturated"] = sat
+        if g_i == 0:                              # first frame of each group: Basler settings
+            shot["basler_settings"] = basler_settings(rig, log)
         if shot["save"].get("blackfly"):
             rgb = rig.grab_blackfly()
             if rgb is not None:
@@ -209,12 +237,17 @@ def calibrate_capture(session, rig, ui, log=print, laser=None):
         raise StageError(f"Gray-code patterns missing in {pat_dir} (e.g. {missing[0].name}). "
                          f"They are made by the first cell of graycode.ipynb.")
     plan = scan_plan(session)
-    flip = bool(session.settings["calibration"].get("flip_patterns_x", False))
+    # Gray codes are shown flipped when the SLM flips every mask (slm flip_x), or with the
+    # older calibration-only switch flip_patterns_x. Either way the table is un-flipped later.
+    slm_flip = rig_flip(rig)
+    flip = slm_flip or bool(session.settings["calibration"].get("flip_patterns_x", False))
     pat_imgs = [_load_mask(p) for p in pats]
-    if flip:
+    if flip and not slm_flip:
         pat_imgs = [np.ascontiguousarray(m[:, ::-1]) for m in pat_imgs]
-        log("Gray-code patterns will be shown FLIPPED left-right (flip_patterns_x). "
-            "The orientation-check frames use the unflipped scan masks.")
+    if flip:
+        log("Gray-code patterns will be shown FLIPPED left-right"
+            + (" (SLM flip on: every mask is flipped, the orientation-check masks too)." if slm_flip
+               else " (flip_patterns_x). The orientation-check frames use the unflipped scan masks."))
     masks = pat_imgs + [_black()] + [_load_mask(plan[k]["mask"]) for k in CHECK_MASKS]
     ui.main(lambda: rig.load_masks(masks))
     names = [f"cap_{i:02d}.png" for i in range(N_PATTERNS)] + ["cap_white.png", "cap_black.png"]
@@ -267,14 +300,17 @@ def calibrate_capture(session, rig, ui, log=print, laser=None):
             {"incomplete": True, "started": _now(), "nm": nm, "exposure_us": exp, "flip_patterns_x": flip}, indent=2))
     run_shots(rig, shots, ui, log)
     if any(s["save"]["basler"].parent.name == "check" for s in shots):
-        (cap / "check" / "scale.json").write_text(json.dumps({"pixel_scale": PIXEL_SCALE}))
+        (cap / "check" / "scale.json").write_text(json.dumps({"pixel_scale": PIXEL_SCALE,
+                                                              "masks_flipped_x": slm_flip}))
     record = json.loads((cal / "capture.json").read_text()) if (cal / "capture.json").is_file() else {}
     per_laser = record.get("per_laser", {})
     for folder, nm, exp in lasers:          # record each laser separately (others are kept)
         sat = [s["save"]["basler"].name for s in shots if s["group"] == folder and s["saturated"] > 0.001]
         entry = {"nm": nm, "exposure_us": exp, "flip_patterns_x": flip, "captured": _now(),
                  "patterns_folder": str(pat_dir), "settle_ms": session.settings["settle_ms"],
-                 "saturated_frames": sat, "check_frames": folder == check_laser}
+                 "saturated_frames": sat, "check_frames": folder == check_laser,
+                 "basler_settings": next((s.get("basler_settings") for s in shots
+                                          if s["group"] == folder and "basler_settings" in s), None)}
         (cap / folder / "patterns.json").write_text(json.dumps(entry, indent=2))
         per_laser[folder] = entry
         if sat:
@@ -421,7 +457,9 @@ def calibrate_check(session, log=print):
     sc = check_scale(chk)
     zero = read_basler(files[0], sc)
     frames = {k: read_basler(chk / f"mask_{k:02d}.tiff", sc) for k in CHECK_MASKS}
-    masks = {k: _load_mask(plan[k]["mask"]) > 0 for k in CHECK_MASKS}
+    sj = chk / "scale.json"
+    shown_flipped = bool(json.loads(sj.read_text()).get("masks_flipped_x", False)) if sj.is_file() else False
+    masks = {k: as_shown(_load_mask(plan[k]["mask"]), shown_flipped) > 0 for k in CHECK_MASKS}
     laser = session.settings["calibration"]["check_laser"]
     nm = next(nm for f, nm, _ in session.settings["calibration"]["lasers"] if f == laser)
     log(f"Orientation check (calibration, {nm} nm laser):")
@@ -447,10 +485,17 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
     bf = s["blackfly"]["enabled"] if use_blackfly is None else use_blackfly
     masks = [_black()] + [_load_mask(r["mask"]) for r in plan]
     ui.main(lambda: rig.load_masks(masks))
-    # keep a copy of the masks with the scene, so it is self-contained
+    # keep a copy of the masks with the scene, so it is self-contained. These are the masks
+    # as shown (flipped when the SLM flip is on), which is what the cube needs.
+    flip = rig_flip(rig)
     (sd / "masks").mkdir(parents=True, exist_ok=True)
-    for r in plan:
-        shutil.copy2(r["mask"], sd / "masks" / Path(r["mask"]).name)
+    for r, m in zip(plan, masks[1:]):
+        if flip:
+            cv2.imwrite(str(sd / "masks" / Path(r["mask"]).name), as_shown(m, True))
+        else:
+            shutil.copy2(r["mask"], sd / "masks" / Path(r["mask"]).name)
+    if flip:
+        log("Masks are shown flipped left-right; the scene's masks/ folder holds the flipped copies.")
 
     shots = []
     if s["capture"]["zero_at_start"]:
@@ -490,6 +535,9 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
         "table": str(session.table), "table_md5": _md5(session.table) if session.table.is_file() else None,
         "zero_frames": [n for n in ("zero_start.tiff", "zero_end.tiff") if (cap / n).is_file()],
         "zero_drift": drift, "blackfly": bool(bf), "blackfly_settings": bf_settings,
+        "basler_settings": shots[0].get("basler_settings"),
+        "masks_flipped_x": flip,
+        "masks_note": "masks/ holds the masks exactly as shown on the SLM" + (" (flipped left-right)" if flip else ""),
         "frames": [{"frame": r["frame"], "dy": r["dy"], "dx": r["dx"], "mask": f"masks/{Path(r['mask']).name}",
                     "capture": f"captures/scan_{r['frame']:02d}.tiff"} for r in plan],
         "saturated_frames": [Path(x["save"]["basler"]).name for x in shots if x["saturated"] > 0.001],
@@ -515,7 +563,7 @@ def capture_position(session, rig, scene, ui, log=print, mask_path=None, use_bla
     """One position of a moving object: the sparse mask (with a Blackfly frame), then the
     black mask (Basler only), at the same exposure, back to back. Saved in
     scenes/<scene>/positions/pos_NN/: mask.tiff, zero.tiff (raw 12-bit), rgb.png + rgb.raw,
-    position.json. Returns the position record."""
+    slm_mask.png + slm_black.png (the SLM patterns used), position.json. Returns the record."""
     sd = session.scene_dir(scene)
     if (sd / "manifest.json").exists():
         raise StageError(f"'{scene}' is a full-scan scene - use another name for the sparse positions.")
@@ -553,7 +601,13 @@ def capture_position(session, rig, scene, ui, log=print, mask_path=None, use_bla
            "mask_mean": float(m.mean()), "zero_mean": float(z.mean()), "bright_fraction": round(shots[0]["bright"], 3),
            "saturated": {"mask.tiff": shots[0]["saturated"], "zero.tiff": shots[1]["saturated"]},
            "blackfly": bool(bf), "blackfly_settings": bf_settings,
+           "basler_settings": shots[0].get("basler_settings"),
            "table": str(session.table)}
+    flip = rig_flip(rig)                             # the patterns exactly as shown (2026-11-06/10)
+    cv2.imwrite(str(pd / "slm_mask.png"), as_shown(mask, flip))
+    cv2.imwrite(str(pd / "slm_black.png"), as_shown(_black(), flip))
+    rec["masks_flipped_x"] = flip
+    rec["slm_masks"] = {"mask.tiff": "slm_mask.png", "zero.tiff": "slm_black.png"}
     (pd / "position.json").write_text(json.dumps(rec, indent=2))
     if rec["zero_mean"] >= rec["mask_mean"]:
         log("WARNING: the black frame is not darker than the mask frame - did the SLM change?")

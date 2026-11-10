@@ -170,6 +170,7 @@ class SLMDisplay:
         expected_size: Optional[Tuple[int, int]] = (1920, 1080),
         mirrored: bool = False,
         master=None,
+        flip_x: bool = False,
     ):
         """Prepare (but don't yet display) a sequence of masks.
 
@@ -214,6 +215,10 @@ class SLMDisplay:
                 interpreter rather than a second, separate one. Leave as
                 None for standalone use (e.g. the test_on_hardware_*.py
                 scripts), where SLMDisplay creates and owns its own Tk().
+            flip_x: Show every mask flipped left-right (added 2026-11-10).
+                self.masks keeps the masks as given; only what goes on the
+                SLM is flipped. Can be changed later with set_flip_x();
+                shown_mask(i) returns mask i exactly as it is displayed.
 
         Raises:
             SLMError: if tkinter or opencv isn't installed, no masks were
@@ -256,6 +261,7 @@ class SLMDisplay:
         self.window_name = window_name
         self.mirrored = mirrored
         self.master = master
+        self.flip_x = bool(flip_x)
         self._is_open = False
         self._current_index: Optional[int] = None
         self._stop_requested = False
@@ -288,7 +294,7 @@ class SLMDisplay:
 
         self.masks.append(mask)
         if self._is_open:
-            self._photos.append(tk.PhotoImage(data=_ndarray_to_pgm_bytes(mask)))
+            self._photos.append(self._photo(mask))
         return len(self.masks) - 1
 
     def remove_mask(self, index: int):
@@ -363,11 +369,33 @@ class SLMDisplay:
             return
 
         self._photos = [
-            tk.PhotoImage(data=_ndarray_to_pgm_bytes(mask)) for mask in self.masks
+            self._photo(mask) for mask in self.masks
         ]
         if self._current_index is None or self._current_index >= len(self.masks):
             self._current_index = 0
         self.show_mask(self._current_index)
+
+    def displayed(self, mask: np.ndarray) -> np.ndarray:
+        """`mask` as it appears on the SLM (flipped left-right when flip_x is on)."""
+        return np.ascontiguousarray(mask[:, ::-1]) if self.flip_x else mask
+
+    def shown_mask(self, index: int) -> np.ndarray:
+        """masks[index] exactly as it is displayed."""
+        return self.displayed(self.masks[index])
+
+    def _photo(self, mask):
+        return tk.PhotoImage(data=_ndarray_to_pgm_bytes(np.ascontiguousarray(self.displayed(mask))))
+
+    def set_flip_x(self, on: bool) -> None:
+        """Turn the left-right flip on or off; an open display is redrawn at once."""
+        on = bool(on)
+        if on == self.flip_x:
+            return
+        self.flip_x = on
+        if self._is_open:
+            self._photos = [self._photo(mask) for mask in self.masks]
+            if self._current_index is not None and self._current_index < len(self.masks):
+                self.show_mask(self._current_index)
 
     def _find_monitor(self):
         """Pick the target monitor per monitor_index/mirrored, same logic
@@ -446,7 +474,7 @@ class SLMDisplay:
             # raises TclError -- Tk's built-in netpbm reader identifies
             # itself as "PPM" and covers PBM/PGM/PPM together, but
             # auto-detection sidesteps needing to know that.)
-            tk.PhotoImage(data=_ndarray_to_pgm_bytes(mask))
+            self._photo(mask)
             for mask in self.masks
         ]
 

@@ -220,6 +220,10 @@ class App:
             btn = ttk.Button(bar, text="Open", width=6, command=lambda k=key: self._hw_toggle(k))
             btn.pack(side="left", padx=(2, 0))
             self.hw_widgets[key] = (dot, btn)
+            if key == "slm":                 # every mask flipped left-right (2026-11-10)
+                self.slm_flip_var = tk.BooleanVar(value=True)
+                ttk.Checkbutton(bar, text="Flip masks ↔", variable=self.slm_flip_var,
+                                command=self._slm_flip_toggle).pack(side="left", padx=(6, 0))
             if key == "blackfly":            # its processing switches + what the camera reports
                 self.bf_gamma_var, self.bf_wb_var = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
                 self.bf_gamma_cb = ttk.Checkbutton(bar, text="Gamma", variable=self.bf_gamma_var,
@@ -269,10 +273,49 @@ class App:
         self.hw_all_btn.configure(state="disabled" if (self.busy or sim or all_open) else "normal")
         self._bf_refresh()
         self._sync_cap_exposure()
+        self._slm_flip_sync()
         try:
             self.root.after(1000, self._hw_refresh)
         except tk.TclError:
             pass
+
+    # ---- SLM left-right flip (top bar) <-> camera GUI checkbox <-> session.json
+    def _lab_flip_var(self):
+        return getattr(self.lab, "slm_flip_var", None) if self.lab is not None else None
+
+    def _slm_flip_apply(self, on):
+        """Set the camera GUI's flip (redraws an open SLM)."""
+        lv = self._lab_flip_var()
+        if lv is not None and bool(lv.get()) != on:
+            lv.set(on)
+            self.lab._on_slm_flip_toggle()
+
+    def _slm_flip_save(self, on):
+        if self.session is not None:
+            self.session.reload()
+            self.session.settings["slm"]["flip_x"] = on
+            self.session.save()
+
+    def _slm_flip_toggle(self):
+        if self.busy:                       # never change it in the middle of a capture
+            self.slm_flip_var.set(not self.slm_flip_var.get())
+            messagebox.showinfo("Flip masks", "Wait until the current job has finished.")
+            return
+        on = bool(self.slm_flip_var.get())
+        self._slm_flip_apply(on)
+        self._slm_flip_save(on)
+        self.log(f"Masks are {'shown FLIPPED left-right' if on else 'no longer flipped'} on the SLM "
+                 f"(saved in session.json).")
+
+    def _slm_flip_sync(self):
+        """Follow a change made with the checkbox in the camera GUI's SLM panel."""
+        lv = self._lab_flip_var()
+        if lv is None or not hasattr(self, "slm_flip_var"):
+            return
+        on = bool(lv.get())
+        if on != bool(self.slm_flip_var.get()):
+            self.slm_flip_var.set(on)
+            self._slm_flip_save(on)
 
     # ---- Basler exposure box (Capture tab) <-> camera
     def _basler_cam(self):
@@ -581,7 +624,8 @@ class App:
         self.settle_var = tk.StringVar()
         ttk.Entry(opts, textvariable=self.settle_var, width=7).pack(side="left", padx=(4, 16))
         self.flip_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Flip Gray-code patterns left-right (same for all lasers)",
+        ttk.Checkbutton(opts, text="Flip Gray-code patterns left-right (same for all lasers; "
+                                   "always flipped while 'Flip masks' is on)",
                         variable=self.flip_var).pack(side="left")
 
         btns = ttk.Frame(f)
@@ -1097,6 +1141,10 @@ class App:
                 pass
         self.settle_var.set(str(s["settle_ms"]))
         self.flip_var.set(bool(s["calibration"].get("flip_patterns_x", False)))
+        if hasattr(self, "slm_flip_var"):               # the session's SLM flip -> top bar + camera GUI
+            on = bool(s["slm"].get("flip_x", True))
+            self.slm_flip_var.set(on)
+            self._slm_flip_apply(on)
         self.cap_exp.set(str(s["capture"]["exposure_us"]))
         self.bf_var.set(bool(s["blackfly"]["enabled"]))
         self.live_exp.set(str(s["capture"]["exposure_us"]))
@@ -1143,6 +1191,8 @@ class App:
             s["calibration"]["flip_patterns_x"] = bool(self.flip_var.get())
             s["capture"]["exposure_us"] = float(self.cap_exp.get())
             s["blackfly"]["enabled"] = bool(self.bf_var.get())
+            if hasattr(self, "slm_flip_var"):
+                s["slm"]["flip_x"] = bool(self.slm_flip_var.get())
         except ValueError:
             messagebox.showerror("Settings", "Wavelengths, exposures and settle time must be numbers."); return False
         self.session.save()

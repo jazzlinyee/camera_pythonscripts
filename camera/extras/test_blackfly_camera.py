@@ -182,6 +182,17 @@ class BlackflyCameraTests(unittest.TestCase):
         self._open_camera()
         self.fake_cam.ExposureAuto.SetValue.assert_not_called()
 
+    def test_configure_sets_full_sensor_no_offset(self):
+        self.fake_cam.Width.GetMax.return_value = 1440
+        self.fake_cam.Height.GetMax.return_value = 1080
+        self._open_camera()
+        self.fake_cam.OffsetX.SetValue.assert_called_once_with(0)
+        self.fake_cam.OffsetY.SetValue.assert_called_once_with(0)
+        self.fake_cam.Width.SetValue.assert_called_once_with(1440)
+        self.fake_cam.Height.SetValue.assert_called_once_with(1080)
+        self.fake_cam.BinningHorizontal.SetValue.assert_called_once_with(1)
+        self.fake_cam.BinningVertical.SetValue.assert_called_once_with(1)
+
     def test_configure_turns_auto_gain_off_by_default(self):
         self._open_camera()
         self.fake_cam.GainAuto.SetValue.assert_called_once_with("GainAuto_Off")
