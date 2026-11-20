@@ -1890,6 +1890,9 @@ class LiveWindow:
         if self.app.busy:
             self._msg(f"Paused while '{self.app.busy}' runs")
             return
+        if getattr(self.app.lab, "_auto_exp_busy", False):     # it grabs from the camera in a thread
+            self._msg("Paused while Auto Exposure runs (camera window)")
+            return
         choice = self.cam_var.get()
         cam = self.app.live_camera(choice)
         if cam is None:
