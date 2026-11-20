@@ -176,6 +176,10 @@ def _jobs_from_positions(scenes):
                              blackfly=(p / "rgb.png") if (p / "rgb.png").is_file() else None,
                              zero=(p / "zero.tiff") if (p / "zero.tiff").is_file() else None,
                              mask=(p / "slm_mask.png") if (p / "slm_mask.png").is_file() else rec.get("mask_file"),
+                             # saved in the original orientation but shown flipped (2026-11-20 on);
+                             # positions from 11-10..11-20 saved the flipped copy itself
+                             flip_mask=bool(rec.get("masks_flipped_x")) and (
+                                 rec.get("saved_masks") == "original orientation" or not (p / "slm_mask.png").is_file()),
                              folder=p, scale=rec.get("pixel_scale", 1)))
     return jobs
 
@@ -198,14 +202,18 @@ def run(sources, session_name, guide, out, mask_path=None, zero_path=None, backg
     from scipy.ndimage import label
     masks = {}
 
-    def get_mask(path):
-        if path not in masks:
+    def get_mask(path, flip=False):
+        """flip: the mask file is in its original orientation but the SLM showed it flipped
+        left-right, so flip it to match what the camera saw."""
+        if (path, flip) not in masks:
             m8 = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
             if m8 is None or m8.shape != rx.shape[1:]:
                 sys.exit(f"Mask {path} missing or not {rx.shape[2]}x{rx.shape[1]}")
+            if flip:
+                m8 = np.ascontiguousarray(m8[:, ::-1])
             m = m8 > 0
-            masks[path] = (m,) + label(m)
-        return masks[path]
+            masks[(path, flip)] = (m,) + label(m)
+        return masks[(path, flip)]
 
     global_zero = read_raw12(zero_path) if zero_path else None
     log(f"RGB covers {rgb_valid.mean():.1%} of the SLM.")
@@ -213,7 +221,7 @@ def run(sources, session_name, guide, out, mask_path=None, zero_path=None, backg
         mpath = mask_path or j["mask"]
         if not mpath:
             sys.exit(f"No mask given for {j['basler']} (use --mask).")
-        mask, labels, n = get_mask(str(mpath))
+        mask, labels, n = get_mask(str(mpath), flip=(not mask_path) and j.get("flip_mask", False))
         g = read_raw12(j["basler"], j.get("scale"))
         if j["zero"] is not None:
             zero, mode, how = read_raw12(j["zero"], j.get("scale")), "measured", f"black frame {j['zero']}"
@@ -232,6 +240,7 @@ def run(sources, session_name, guide, out, mask_path=None, zero_path=None, backg
         rgb = rgb_on_slm(bf, gx, gy) if bf else np.zeros(mask.shape + (3,), np.float32)
         info = {"basler": str(j["basler"]), "blackfly": str(bf) if bf else None, "folder": str(Path(j["folder"]).resolve()),
                 "mask": str(Path(mpath).resolve()), "table": str(session.table),
+                "mask_flipped_x": bool((not mask_path) and j.get("flip_mask", False)),
                 "guide": str(Path(guide).resolve()), "made": datetime.now().isoformat(timespec="seconds"),
                 "background": mode, "background_method": how,
                 "qe": "multiplied (as meas2hyper.ipynb)", "units_raw": "raw 12-bit x QE"}

@@ -485,17 +485,21 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
     bf = s["blackfly"]["enabled"] if use_blackfly is None else use_blackfly
     masks = [_black()] + [_load_mask(r["mask"]) for r in plan]
     ui.main(lambda: rig.load_masks(masks))
-    # keep a copy of the masks with the scene, so it is self-contained. These are the masks
-    # as shown (flipped when the SLM flip is on), which is what the cube needs.
+    # keep a copy of the masks with the scene, so it is self-contained: masks/ in the original
+    # orientation (2026-11-20). With the SLM flip on, the cube and the check need the masks as
+    # they were shown, so those go in masks_as_shown/ and the manifest points there.
     flip = rig_flip(rig)
     (sd / "masks").mkdir(parents=True, exist_ok=True)
-    for r, m in zip(plan, masks[1:]):
-        if flip:
-            cv2.imwrite(str(sd / "masks" / Path(r["mask"]).name), as_shown(m, True))
-        else:
-            shutil.copy2(r["mask"], sd / "masks" / Path(r["mask"]).name)
     if flip:
-        log("Masks are shown flipped left-right; the scene's masks/ folder holds the flipped copies.")
+        (sd / "masks_as_shown").mkdir(parents=True, exist_ok=True)
+    for r, m in zip(plan, masks[1:]):
+        shutil.copy2(r["mask"], sd / "masks" / Path(r["mask"]).name)
+        if flip:
+            cv2.imwrite(str(sd / "masks_as_shown" / Path(r["mask"]).name), as_shown(m, True))
+    if flip:
+        log("Masks are shown flipped left-right: masks/ has the originals, masks_as_shown/ the "
+            "flipped copies that Make cube uses.")
+    shown_dir = "masks_as_shown" if flip else "masks"
 
     shots = []
     if s["capture"]["zero_at_start"]:
@@ -537,8 +541,10 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
         "zero_drift": drift, "blackfly": bool(bf), "blackfly_settings": bf_settings,
         "basler_settings": shots[0].get("basler_settings"),
         "masks_flipped_x": flip,
-        "masks_note": "masks/ holds the masks exactly as shown on the SLM" + (" (flipped left-right)" if flip else ""),
-        "frames": [{"frame": r["frame"], "dy": r["dy"], "dx": r["dx"], "mask": f"masks/{Path(r['mask']).name}",
+        "masks_note": ("masks/ = original orientation; masks_as_shown/ = flipped left-right as on the SLM "
+                       "(frames[].mask, used by Make cube)") if flip else "masks/ = the masks as shown",
+        "frames": [{"frame": r["frame"], "dy": r["dy"], "dx": r["dx"], "mask": f"{shown_dir}/{Path(r['mask']).name}",
+                    "mask_original": f"masks/{Path(r['mask']).name}",
                     "capture": f"captures/scan_{r['frame']:02d}.tiff"} for r in plan],
         "saturated_frames": [Path(x["save"]["basler"]).name for x in shots if x["saturated"] > 0.001],
     }
@@ -603,10 +609,11 @@ def capture_position(session, rig, scene, ui, log=print, mask_path=None, use_bla
            "blackfly": bool(bf), "blackfly_settings": bf_settings,
            "basler_settings": shots[0].get("basler_settings"),
            "table": str(session.table)}
-    flip = rig_flip(rig)                             # the patterns exactly as shown (2026-11-06/10)
-    cv2.imwrite(str(pd / "slm_mask.png"), as_shown(mask, flip))
-    cv2.imwrite(str(pd / "slm_black.png"), as_shown(_black(), flip))
-    rec["masks_flipped_x"] = flip
+    flip = rig_flip(rig)                             # the patterns used, original orientation (2026-11-20)
+    cv2.imwrite(str(pd / "slm_mask.png"), mask)
+    cv2.imwrite(str(pd / "slm_black.png"), _black())
+    rec["masks_flipped_x"] = flip                    # shown flipped on the SLM; the export flips it back
+    rec["saved_masks"] = "original orientation"
     rec["slm_masks"] = {"mask.tiff": "slm_mask.png", "zero.tiff": "slm_black.png"}
     (pd / "position.json").write_text(json.dumps(rec, indent=2))
     if rec["zero_mean"] >= rec["mask_mean"]:
@@ -640,7 +647,10 @@ def scene_check(session, scene, log=print):
     sc = scene_scale(sd)
     zero = read_basler(sd / "captures" / "zero.tiff", sc)
     frames = {k: read_basler(sd / "captures" / f"scan_{k:02d}.tiff", sc) for k in CHECK_MASKS}
-    masks = {k: cv2.imread(str(sd / "masks" / f"mask_{k:02d}.png"), cv2.IMREAD_GRAYSCALE) > 0 for k in CHECK_MASKS}
+    # the masks as shown on the SLM: masks_as_shown/ when the flip was on (scenes from
+    # 2026-11-20); otherwise masks/ (which held the as-shown copies before that)
+    md = sd / "masks_as_shown" if (sd / "masks_as_shown").is_dir() else sd / "masks"
+    masks = {k: cv2.imread(str(md / f"mask_{k:02d}.png"), cv2.IMREAD_GRAYSCALE) > 0 for k in CHECK_MASKS}
     log("Orientation check (scene captures vs table):")
     res = orientation_check(session.table, zero, frames, masks, band_nm=550, log=log, strict_alignment=False)
     (sd / "check.json").write_text(json.dumps(res, indent=2))

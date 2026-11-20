@@ -122,8 +122,8 @@ SLM_OPENS_WHITE = True
 
 # Every mask is shown flipped left-right on the SLM (added 2026-11-10). The mask files are
 # not changed; only what goes on the SLM is. The "Flip masks left-right" checkbox in the
-# SLM panel turns it off/on. Saved mask copies (capture_masks.json) are the flipped
-# version, i.e. exactly what was on the SLM.
+# SLM panel turns it off/on. Saved mask copies (capture_masks.json) are in the original
+# orientation; their "flipped_x" says whether the SLM showed them flipped.
 SLM_FLIP_X = True
 
 OUTPUT_DIR = Path("test_captures")
@@ -948,14 +948,14 @@ class App:
         info = {"folder": self.mask_folders[i] if i < len(self.mask_folders) else "",
                 "source": str(self.mask_paths[i]) if i < len(self.mask_paths) else "",
                 "flipped_x": bool(self.slm_flip_var.get())}
-        return (self.mask_names[i], self._as_shown(self.masks[i]), info)
+        return (self.mask_names[i], self.masks[i], info)     # original orientation (2026-11-20)
 
     def _record_capture_mask(self, saved: Path, on_slm):
         """Save the SLM pattern used for this photo next to it (added 2026-11-06): each
         distinct mask once, as <mask name>.png (_2, _3, ... if a different mask has the same
         name), and capture_masks.json mapping every photo to its mask file. Never stops a
-        capture. With the left-right flip on, the copy is the flipped image actually shown,
-        saved as <mask name>_flipped.png (2026-11-10)."""
+        capture. The copy is always in the mask file's original orientation (2026-11-20);
+        "flipped_x" in the record says whether the SLM showed it flipped left-right."""
         try:
             path = saved.parent / "capture_masks.json"
             record = json.loads(path.read_text()) if path.is_file() else {}
@@ -968,8 +968,6 @@ class App:
             else:
                 name, img, info = on_slm
                 stem = self._clean_filename(name) or "mask"
-                if info.get("flipped_x") and name != "white":
-                    stem += "_flipped"              # not the same image as the original file
                 mask_file, n = f"{stem}.png", 2
                 while (saved.parent / mask_file).exists():
                     old = cv2.imread(str(saved.parent / mask_file), cv2.IMREAD_GRAYSCALE)
