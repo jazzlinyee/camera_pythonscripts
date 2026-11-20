@@ -203,8 +203,8 @@ def auto_search(rig, ui, log, spec, start_us=None):
     ae, mod = spec["ae"], spec["mod"]
     stopped = getattr(ui, "stopped", lambda: False)
     label = f" ({spec['label']})" if spec.get("label") else ""
-    log(f"Finding the Basler exposure{label}: longest with at most {ae['max_saturated']:.2%} of pixels "
-        f"saturated, testing {len(spec['indices'])} mask(s)...")
+    log(f"Finding the Basler exposure{label}: longest with no saturated area (single hot pixels ignored), "
+        f"testing {len(spec['indices'])} mask(s)...")
 
     def grab_basler(us):
         rig.set_exposure(us)
@@ -236,7 +236,7 @@ def auto_search(rig, ui, log, spec, start_us=None):
         out["blackfly"] = mod.search(grab_blackfly, getattr(rig, "blackfly_exposure_us", None) or 20000, 255,
                                      min_us=ae["min_us"], max_us=ae.get("blackfly_max_us", ae["max_us"]),
                                      max_saturated=ae["max_saturated"], log=log,
-                                     stopped=stopped, name="Blackfly")
+                                     stopped=stopped, name="Blackfly", bayer=True)
         rig.set_blackfly_exposure(out["blackfly"]["exposure_us"])
     return out
 
@@ -257,7 +257,8 @@ def find_exposure(session, rig, ui, log=print, kind="scene", laser=None, mask_pa
             raise StageError(f"No laser called {laser!r} in session.json.")
         folder, nm, exp = lasers[0]
         white = session.lab_path("patterns") / "pat_white.png"
-        masks, spec = [_load_mask(white)], auto_spec(session, [0], label=f"{folder} laser, white frame")
+        # keep=True: the camera (and the Live window) stays at the found exposure afterwards
+        masks, spec = [_load_mask(white)], auto_spec(session, [0], keep=True, label=f"{folder} laser, white frame")
         start = exp
     elif kind == "scene":
         plan = scan_plan(session)

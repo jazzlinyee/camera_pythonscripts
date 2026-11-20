@@ -129,8 +129,9 @@ SLM_OPENS_WHITE = True
 # orientation; their "flipped_x" says whether the SLM showed them flipped.
 SLM_FLIP_X = True
 
-# "Auto Exposure" button (added 2026-11-20): the longest exposure with at most 0.01 % of the
-# pixels at full scale, for whatever is on the SLM. Limits per camera, in microseconds.
+# "Auto Exposure" button (added 2026-11-20): the longest exposure where no AREA of the image
+# (a 4 x 4 pixel block) is at full scale - single hot pixels are ignored - for whatever is on
+# the SLM. See auto_exposure.py. Limits per camera, in microseconds.
 AUTO_EXPOSURE_MIN_US = 20
 AUTO_EXPOSURE_MAX_US = {"basler": 2_000_000, "blackfly": 1_000_000}
 AUTO_EXPOSURE_FULL_SCALE = {"basler": 4095, "blackfly": 255}
@@ -823,7 +824,8 @@ class App:
             start = float(cam.get_exposure_time())
         except (CameraError, TypeError, ValueError):
             start = 10000.0
-        self.log(f"Auto exposure ({choice}): longest exposure with at most 0.01% of pixels at {full}...")
+        self.log(f"Auto exposure ({choice}): longest exposure with no saturated area at {full} "
+                 f"(single hot pixels ignored)...")
 
         def grab(us):
             # a frame that started exposing before the change is thrown away (exposure-aware)
@@ -848,7 +850,8 @@ class App:
             try:
                 res = auto_exposure.search(
                     grab, start, full, min_us=AUTO_EXPOSURE_MIN_US, max_us=AUTO_EXPOSURE_MAX_US[choice],
-                    log=lambda m: self._ae_queue.put(("log", m)), name=choice)
+                    log=lambda m: self._ae_queue.put(("log", m)), name=choice,
+                    bayer=(choice == "blackfly"))
                 err = None
             except Exception as e:  # noqa: BLE001
                 res, err = None, e
