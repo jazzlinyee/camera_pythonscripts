@@ -129,9 +129,9 @@ SLM_OPENS_WHITE = True
 # orientation; their "flipped_x" says whether the SLM showed them flipped.
 SLM_FLIP_X = True
 
-# "Auto Exposure" button (added 2026-11-20): the longest exposure where no AREA of the image
-# (a 4 x 4 pixel block) is at full scale - single hot pixels are ignored - for whatever is on
-# the SLM. See auto_exposure.py. Limits per camera, in microseconds.
+# "Auto Exposure" button (added 2026-11-20): the longest exposure where no part of the image
+# (a patch or streak of saturated pixels) clips - isolated hot pixels are ignored - for whatever
+# is on the SLM. See auto_exposure.py. Limits per camera, in microseconds.
 AUTO_EXPOSURE_MIN_US = 20
 AUTO_EXPOSURE_MAX_US = {"basler": 2_000_000, "blackfly": 1_000_000}
 AUTO_EXPOSURE_FULL_SCALE = {"basler": 4095, "blackfly": 255}

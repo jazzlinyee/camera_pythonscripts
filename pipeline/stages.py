@@ -203,7 +203,7 @@ def auto_search(rig, ui, log, spec, start_us=None):
     ae, mod = spec["ae"], spec["mod"]
     stopped = getattr(ui, "stopped", lambda: False)
     label = f" ({spec['label']})" if spec.get("label") else ""
-    log(f"Finding the Basler exposure{label}: longest with no saturated area (single hot pixels ignored), "
+    log(f"Finding the Basler exposure{label}: longest with nothing clipping (isolated hot pixels ignored), "
         f"testing {len(spec['indices'])} mask(s)...")
 
     def grab_basler(us):

@@ -237,10 +237,12 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
   (never twice) and the table is un-flipped as before, so it stays in real SLM columns. The
   older calibration-only switch (`flip_patterns_x` in session.json; its Calibrate-tab checkbox
   was removed 2026-11-20) only matters with the flip off.
-- **Auto exposure** (since 2026-11-20). Finds the longest exposure where no *area* of the
-  image is saturated: no block of 4 x 4 pixels entirely at full scale (4095 Basler, 255
-  Blackfly; for the Blackfly's Bayer mosaic each colour plane is checked separately). Single
-  saturated pixels (hot pixels, tiny glints) are ignored however many there are, so the result
+- **Auto exposure** (since 2026-11-20). Finds the longest exposure where no *part* of the
+  image clips: fewer than 16 "clipped" pixels, a clipped pixel being at full scale (4095 Basler,
+  255 Blackfly) with at least 2 of its 8 neighbours at full scale too, so clipping patches and
+  thin clipping streaks count whatever their shape (for the Blackfly's Bayer mosaic each colour
+  plane is checked separately). Isolated saturated pixels (hot pixels) are ignored however many
+  there are, so the result
   is the exposure just before a part of the image turns red in the Live window, within 2 %. It
   jumps close, then bisects between "fine" and "saturated"; usually 5-10 test frames.
   - **Auto** buttons: on each laser row (tested on that laser's white Gray-code frame, the
