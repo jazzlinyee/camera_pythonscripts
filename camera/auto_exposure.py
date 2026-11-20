@@ -6,14 +6,9 @@ Used by the camera GUI's "Auto Exposure" button and by the pipeline (Auto button
 that takes an exposure, sets it on the camera and returns a fresh frame (or a list of
 frames, e.g. one per mask); it never talks to a camera itself.
 
-"Oversaturated" (changed 2026-11-20) = a part of the image clips: at least MIN_CLIPPED (16)
-"clipped" pixels, where a clipped pixel is at full scale (4095 for the 12-bit Basler, 255 for
-the 8-bit Blackfly) AND has at least 2 of its 8 neighbours at full scale too. So a clipping
-patch or a thin clipping streak (the dispersed smears are often only 1-3 pixels wide) counts,
-whatever its shape, while isolated saturated pixels - hot pixels, which multiply at long
-exposures - never do, however many there are. (A first version demanded a fully saturated
-4 x 4 block; thin streaks never fill one, so it overexposed.) For the Blackfly's Bayer mosaic
-each colour plane is checked on its own.
+"Oversaturated" = more than `max_saturated` of all pixels at full scale (4095 for the 12-bit
+Basler, 255 for the 8-bit Blackfly). Default 0.01 % (Rika, 2026-11-20), so a few hot pixels
+don't count: the same measure as the Live window's "saturated ... % of pixels" readout.
 
 Goal (changed 2026-11-20 at Rika's request): the exposure just before parts turn red, not
 a safety margin below it. How it searches (usually 5-9 frames):
@@ -31,50 +26,21 @@ import math
 
 import numpy as np
 
-DEFAULT_MAX_SATURATED = 1e-4      # brightness = the level only this fraction of pixels exceed
-MIN_NEIGHBOURS = 2                # a saturated pixel with >= this many saturated neighbours = clipped
-MIN_CLIPPED = 16                  # this many clipped pixels (in one frame) = the exposure is too long
+DEFAULT_MAX_SATURATED = 1e-4      # allowed fraction of pixels at full scale (0.01 %)
 EDGE_GAP = 0.02                   # stop when "fine" and "saturated" are less than 2 % apart
 AIM = 0.99                        # where the jump in step 3 aims (fraction of full scale)
 
 
-def clipped_pixels(mask):
-    """Saturated pixels (True in `mask`) with at least MIN_NEIGHBOURS saturated neighbours
-    among their 8: part of a clipping patch or streak, not an isolated hot pixel."""
-    if not mask.any():
-        return 0
-    h, w = mask.shape
-    p = np.zeros((h + 2, w + 2), np.uint8)
-    p[1:-1, 1:-1] = mask
-    n = np.zeros((h, w), np.uint8)
-    for dy in (0, 1, 2):
-        for dx in (0, 1, 2):
-            if dy != 1 or dx != 1:
-                n += p[dy:dy + h, dx:dx + w]
-    return int(np.count_nonzero(mask & (n >= MIN_NEIGHBOURS)))
-
-
 def measure(frame, full_scale, max_saturated=DEFAULT_MAX_SATURATED, bayer=False):
-    """(saturated fraction, brightness, clipped pixels) of one frame.
-    clipped pixels: see clipped_pixels() (per colour plane for a Bayer frame); MIN_CLIPPED or
-    more means a part of the image clips. saturated fraction = all pixels at full scale, hot
-    pixels included (for the log only). Brightness = the level that only `max_saturated` of the
-    pixels exceed, as a fraction of full scale."""
+    """(saturated fraction, brightness) of one frame. saturated fraction = pixels at full
+    scale / all pixels. Brightness = the level that only `max_saturated` of the pixels
+    exceed (with 0.01 %: the 99.99th percentile), as a fraction of full scale. `bayer` is accepted for compatibility and not needed."""
     a = np.asarray(frame)
-    full = a >= full_scale
-    sat = float(np.count_nonzero(full)) / a.size
-    if bayer and a.ndim == 2:
-        areas = sum(clipped_pixels(full[i::2, j::2]) for i in (0, 1) for j in (0, 1))
-    else:
-        areas = clipped_pixels(full)
+    sat = float(np.count_nonzero(a >= full_scale)) / a.size
     sub = a[::2, ::2].ravel() if a.ndim == 2 and a.size > 4_000_000 else a.ravel()
-    if areas < MIN_CLIPPED:        # only single saturated (hot) pixels: leave them out of the
-        below = sub[sub < full_scale]          # brightness, or it would read "full" already
-        if below.size:
-            sub = below
     k = max(1, int(math.ceil(max_saturated * sub.size)))
     level = float(np.partition(sub, sub.size - k)[sub.size - k]) / full_scale
-    return sat, level, areas
+    return sat, level
 
 
 def _worst(frames, full_scale, max_saturated, bayer):
@@ -83,7 +49,7 @@ def _worst(frames, full_scale, max_saturated, bayer):
     vals = [measure(f, full_scale, max_saturated, bayer) for f in frames if f is not None]
     if not vals:
         raise RuntimeError("no frame from the camera")
-    return max(v[0] for v in vals), max(v[1] for v in vals), max(v[2] for v in vals)
+    return max(v[0] for v in vals), max(v[1] for v in vals)
 
 
 def search(grab, start_us, full_scale, min_us=20.0, max_us=2_000_000.0,
@@ -103,13 +69,11 @@ def search(grab, start_us, full_scale, min_us=20.0, max_us=2_000_000.0,
     for _ in range(max_steps):
         if stopped():
             raise RuntimeError("stopped")
-        sat, level, areas = _worst(grab(exp), full_scale, max_saturated, bayer)
-        steps.append({"exposure_us": round(exp, 1), "saturated": round(sat, 6), "brightness": round(level, 3),
-                      "saturated_areas": areas})
-        over = areas >= MIN_CLIPPED
+        sat, level = _worst(grab(exp), full_scale, max_saturated, bayer)
+        steps.append({"exposure_us": round(exp, 1), "saturated": round(sat, 6), "brightness": round(level, 3)})
+        over = sat > max_saturated
         log(f"  {name} auto exposure: {exp:,.0f} us -> brightest {level:.0%}"
-            + (f", {areas} clipped pixels in saturated patches/streaks (too long)" if over
-               else (f", ok (only single saturated pixels: {sat:.3%})" if sat > 0 else ", ok")))
+            + f", {sat:.3%} of pixels saturated" + (" (too long)" if over else " (ok)"))
         if over:
             bad = exp if bad is None else min(bad, exp)
             if exp <= min_us:
@@ -134,14 +98,12 @@ def search(grab, start_us, full_scale, min_us=20.0, max_us=2_000_000.0,
     else:
         note = note or f"stopped after {max_steps} test frames"
     if good is None:
-        result = {"exposure_us": float(min_us), "brightness": None, "saturated": steps[-1]["saturated"],
-                  "saturated_areas": steps[-1]["saturated_areas"]}
+        result = {"exposure_us": float(min_us), "brightness": None, "saturated": steps[-1]["saturated"]}
         note = note or "no unsaturated exposure found"
     else:
-        result = {"exposure_us": round(good[0], 1), "brightness": round(good[1], 3), "saturated": round(good[2], 6),
-                  "saturated_areas": 0}
+        result = {"exposure_us": round(good[0], 1), "brightness": round(good[1], 3), "saturated": round(good[2], 6)}
     result.update(steps=steps, note=note, full_scale=full_scale, max_saturated=max_saturated,
-                  min_us=min_us, max_us=max_us, edge_gap=EDGE_GAP, min_clipped=MIN_CLIPPED, min_neighbours=MIN_NEIGHBOURS, bayer=bayer)
+                  min_us=min_us, max_us=max_us, edge_gap=EDGE_GAP)
     log(f"  {name} auto exposure: using {result['exposure_us']:,.0f} us"
         + (f" (brightest {result['brightness']:.0%}, just below saturation)" if result["brightness"] is not None
            and not note else (f" (brightest {result['brightness']:.0%})" if result["brightness"] is not None else ""))

@@ -46,7 +46,7 @@ DEFAULTS = {
     # follows the "Flip masks" checkbox (top bar / camera GUI's SLM panel).
     "slm": {"monitor_index": None, "mirrored": False, "flip_x": True},
     # Automatic exposure (2026-11-20): the longest exposure with at most max_saturated of the
-    # pixels at full scale (just before the Live window shows red). before_capture = the "Find
+    # pixels at full scale (0.01 %, like the Live window's "saturated % of pixels"). before_capture = the "Find
     # exposure before capturing" checkbox. scene_test_masks = how many of the 56 scan masks
     # are tested for a full scan (spread evenly; the brightest decides).
     "auto_exposure": {"before_capture": False, "max_saturated": 0.0001,
@@ -117,6 +117,9 @@ class Session:
         for k, old in _OLD_LAB_DEFAULTS.items():
             if self.settings["lab"].get(k) in old:
                 self.settings["lab"][k] = DEFAULTS["lab"][k]
+        ae = self.settings.get("auto_exposure", {})
+        if ae.get("max_saturated") == 0.001:           # 0.1 % was the default for an hour on 11-20
+            ae["max_saturated"] = DEFAULTS["auto_exposure"]["max_saturated"]
 
     def reload(self):
         """Re-read session.json (picks up edits made in a text editor)."""
