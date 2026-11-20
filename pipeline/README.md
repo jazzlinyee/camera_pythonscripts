@@ -105,8 +105,11 @@ preview panes show each mask and frame. Afterwards its masks, live views and exp
 back the way they were. Don't use its own Capture or Auto Cycle during a pipeline capture.
 Progress and warnings appear in the pipeline log at the bottom of the window.
 
-When run this way, the camera GUI keeps its remembered mask folders and default
-`test_captures/` in `pipeline/labgui_state/`, so nothing in `camera/` is written.
+When run this way, the camera GUI keeps its remembered mask folders in
+`pipeline/labgui_state/`, so nothing in `camera/` is written. Photos from its own Capture /
+Capture Both / Auto Cycle go into the current session's `sessions/<session>/test_captures/`
+by default (since 2026-11-20); **Choose…** picks another folder, and switching sessions points
+it back to that session's `test_captures/`.
 Starting it on its own (`cd ../camera`, then `python gui_test_camera_slm.py`) is unaffected.
 
 `python pipeline.py gui --standalone` opens the pipeline without your camera GUI. It connects to

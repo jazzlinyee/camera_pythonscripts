@@ -964,13 +964,19 @@ class App:
         )
         if not folder:
             return
+        self.set_save_folder(Path(folder))
+
+    def set_save_folder(self, folder: Path, why: str = ""):
+        """Save photos into `folder` from now on (also used by the pipeline, which points
+        it at the current session's test_captures/ folder; added 2026-11-20). The folder
+        is created at the first capture."""
         self.save_dir = Path(folder)
         self.save_dir_label.configure(text=str(self.save_dir))
         # Numbering starts again for every folder (2026-10-28): an empty folder gets
         # blackfly_000 / basler_000; a folder with photos continues after its last
         # number (_next_capture_path skips names already on disk).
         self.shots = {k: 0 for k in self.shots}
-        self.log(f"Photos will now be saved to {self.save_dir} (numbering restarts for this folder)")
+        self.log(f"Photos will now be saved to {self.save_dir}{why} (numbering restarts for this folder)")
 
     @staticmethod
     def _clean_filename(raw: str) -> str:

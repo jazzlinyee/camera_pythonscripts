@@ -1137,6 +1137,10 @@ class App:
         self.sess_box.configure(values=list_sessions())
         if self.lab is not None and not self.busy:
             self.rig = None                 # re-made from the camera window for this session
+        if self.lab is not None and hasattr(self.lab, "set_save_folder"):
+            # the camera GUI's photos go into this session's test_captures/ by default (Choose…
+            # still picks another folder; switching sessions points it back here)
+            self.lab.set_save_folder(self.session.dir / "test_captures", f" (session {name})")
         s = self.session.settings
         self.hw_label.configure(text=f"hardware: {s['hardware']}")
         self._build_laser_rows()
