@@ -20,6 +20,7 @@ import hashlib
 import re
 import json
 import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -167,6 +168,146 @@ def basler_settings(rig, log=print):
     return st
 
 
+# =============================================================== AUTO EXPOSURE (2026-11-20)
+def _auto_exposure_module(session):
+    """camera/auto_exposure.py (the search itself, shared with the camera GUI)."""
+    folder = str(session.lab_path("camera_code"))
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+    sys.dont_write_bytecode = True
+    import auto_exposure
+    return auto_exposure
+
+
+def auto_settings(session):
+    return dict(session.settings.get("auto_exposure", {}))
+
+
+def auto_spec(session, indices, blackfly_indices=None, keep=False, label=""):
+    """What auto_search needs: which loaded masks to test (Basler and, optionally, Blackfly)."""
+    return {"ae": auto_settings(session), "mod": _auto_exposure_module(session), "indices": list(indices),
+            "blackfly_indices": list(blackfly_indices or []), "keep": keep, "label": label}
+
+
+def scene_test_indices(session, n_plan):
+    """Scan masks tested for a full scan: `scene_test_masks` of them, spread evenly over
+    1..n_plan (mask list index 0 is the all-zero frame)."""
+    n = max(1, min(int(auto_settings(session).get("scene_test_masks", 8)), n_plan))
+    return sorted({int(round(x)) for x in np.linspace(1, n_plan, n)})
+
+
+def auto_search(rig, ui, log, spec, start_us=None):
+    """Find the longest unsaturated Basler exposure over the masks spec['indices'] (and the
+    Blackfly one over spec['blackfly_indices']), set it on the camera(s) and return
+    {'basler': result, 'blackfly': result or None}. The masks must already be loaded."""
+    ae, mod = spec["ae"], spec["mod"]
+    stopped = getattr(ui, "stopped", lambda: False)
+    label = f" ({spec['label']})" if spec.get("label") else ""
+    log(f"Finding the Basler exposure{label}: longest with at most {ae['max_saturated']:.2%} of pixels "
+        f"saturated, testing {len(spec['indices'])} mask(s)...")
+
+    def grab_basler(us):
+        rig.set_exposure(us)
+        frames = []
+        for i in spec["indices"]:
+            ui.main(lambda i=i: rig.show(i))
+            frames.append(rig.grab_basler())
+        return frames
+
+    out = {"basler": mod.search(grab_basler, start_us or getattr(rig, "exposure_us", None) or 100000, 4095,
+                                min_us=ae["min_us"], max_us=ae["max_us"], max_saturated=ae["max_saturated"],
+                                target=ae["target"], log=log, stopped=stopped, name="Basler"),
+           "blackfly": None}
+    rig.set_exposure(out["basler"]["exposure_us"])
+    if spec.get("keep") and hasattr(rig, "keep_exposure"):
+        rig.keep_exposure(out["basler"]["exposure_us"])
+    if spec.get("blackfly_indices") and hasattr(rig, "set_blackfly_exposure") \
+            and getattr(rig, "blackfly", True) is not None:       # (the simulator has no .blackfly)
+        log("Finding the Blackfly exposure...")
+
+        def grab_blackfly(us):
+            rig.set_blackfly_exposure(us)
+            frames = []
+            for i in spec["blackfly_indices"]:
+                ui.main(lambda i=i: rig.show(i))
+                frames.append(rig.grab_blackfly())
+            return frames
+
+        out["blackfly"] = mod.search(grab_blackfly, getattr(rig, "blackfly_exposure_us", None) or 20000, 255,
+                                     min_us=ae["min_us"], max_us=ae.get("blackfly_max_us", ae["max_us"]),
+                                     max_saturated=ae["max_saturated"], target=ae["target"], log=log,
+                                     stopped=stopped, name="Blackfly")
+        rig.set_blackfly_exposure(out["blackfly"]["exposure_us"])
+    return out
+
+
+def _want_auto(session, auto):
+    return bool(session.settings.get("auto_exposure", {}).get("before_capture", False)) if auto is None else bool(auto)
+
+
+def find_exposure(session, rig, ui, log=print, kind="scene", laser=None, mask_path=None, use_blackfly=None):
+    """The Auto buttons: find the exposure(s) without capturing, set them on the camera(s)
+    and store them in session.json. kind = 'laser' (that laser's white Gray-code frame),
+    'scene' (several scan masks) or 'position' (the sparse mask). Returns auto_search's dict."""
+    s = session.settings
+    bf = (s["blackfly"]["enabled"] if use_blackfly is None else use_blackfly) and kind != "laser"
+    if kind == "laser":
+        lasers = [l for l in s["calibration"]["lasers"] if l[0] == laser]
+        if not lasers:
+            raise StageError(f"No laser called {laser!r} in session.json.")
+        folder, nm, exp = lasers[0]
+        white = session.lab_path("patterns") / "pat_white.png"
+        masks, spec = [_load_mask(white)], auto_spec(session, [0], label=f"{folder} laser, white frame")
+        start = exp
+    elif kind == "scene":
+        plan = scan_plan(session)
+        masks = [_black()] + [_load_mask(r["mask"]) for r in plan]
+        idx = scene_test_indices(session, len(plan))
+        spec = auto_spec(session, idx, idx if bf else None, keep=True,
+                         label=f"{len(idx)} of the {len(plan)} scan masks")
+        start = s["capture"]["exposure_us"]
+    elif kind == "position":
+        mp = Path(mask_path) if mask_path else default_sparse_mask(session)
+        masks = [_load_mask(mp), _black()]
+        spec = auto_spec(session, [0], [0] if bf else None, keep=True, label=f"sparse mask {mp.name}")
+        start = s["capture"]["exposure_us"]
+    else:
+        raise StageError(f"Unknown auto exposure kind {kind!r}")
+    ui.main(lambda: rig.load_masks(masks))
+    if hasattr(rig, "begin"):
+        ui.main(rig.begin)
+    try:
+        if kind == "laser":
+            if hasattr(rig, "set_light"):
+                rig.set_light(folder)
+            else:
+                msg = f"Turn ON the {nm} nm laser ({folder}) and make sure the other lasers are OFF."
+                log(f"  >> {msg}  (waiting for OK)")
+                if not ui.prompt(msg):
+                    raise StageError("Cancelled.")
+        res = auto_search(rig, ui, log, spec, start_us=start)
+    finally:
+        if hasattr(rig, "end"):
+            ui.main(rig.end)
+    session.reload()
+    if kind == "laser":
+        for l in session.settings["calibration"]["lasers"]:
+            if l[0] == laser:
+                l[2] = res["basler"]["exposure_us"]
+    else:
+        session.settings["capture"]["exposure_us"] = res["basler"]["exposure_us"]
+    if res.get("blackfly"):
+        session.settings["blackfly"]["exposure_us"] = res["blackfly"]["exposure_us"]
+    session.save()
+    return res
+
+
+def _auto_record(shots, group):
+    """(exposure_source, auto result) of a group of shots, for the records."""
+    r = next((s.get("auto_result") for s in shots if s.get("group") == group and s.get("auto_result")), None)
+    return ("auto" if r else "manual"), r
+
+
 def _run_shots(rig, shots, ui, log):
     n = len(shots)
     group = None
@@ -186,6 +327,12 @@ def _run_shots(rig, shots, ui, log):
                         raise StageError("Cancelled.")
                     log("  >> OK - capturing")
             g_t0, g_i, g_n = time.time(), 0, sum(1 for s in shots if s.get("group") == group)
+            if shot.get("auto"):                  # find the exposure first (2026-11-20)
+                res = auto_search(rig, ui, log, shot["auto"], start_us=shot.get("exposure"))
+                for s2 in shots:
+                    if s2.get("group") == group:
+                        s2["exposure"] = res["basler"]["exposure_us"]
+                shot["auto_result"] = res
             if shot.get("exposure"):
                 rig.set_exposure(shot["exposure"])
                 log(f"  exposure {shot['exposure']:.0f} us")
@@ -223,7 +370,7 @@ def _run_shots(rig, shots, ui, log):
 
 
 # =============================================================== CALIBRATE
-def calibrate_capture(session, rig, ui, log=print, laser=None):
+def calibrate_capture(session, rig, ui, log=print, laser=None, auto=None):
     """Capture the Gray-code patterns under one laser (laser='Blue' etc., the folder name in
     session.json), or under every laser in the list when laser is None. The orientation-check
     frames are added when the captured laser is the check laser. Other lasers' captures are
@@ -259,9 +406,11 @@ def calibrate_capture(session, rig, ui, log=print, laser=None):
         raise StageError(f"No laser called {laser!r} in session.json (have: {', '.join(l[0] for l in all_lasers)}).")
     check_laser = session.settings["calibration"]["check_laser"]
     t0 = time.time()
+    use_auto = _want_auto(session, auto)
     for folder, nm, exp in lasers:
         prompt = (f"Turn ON the {nm} nm laser ({folder}) and make sure the other lasers are OFF. "
                   f"Nothing else in the setup should move from now on.")
+        first = len(shots)
         n_shots = len(names) + (1 + len(CHECK_MASKS) if folder == check_laser else 0)
         pat_names = [f"pat_{i:02d}" for i in range(N_PATTERNS)] + ["white", "black"]
         for idx, name in enumerate(names):
@@ -277,7 +426,9 @@ def calibrate_capture(session, rig, ui, log=print, laser=None):
                 shots.append(dict(mask_index=base + j, save={"basler": cap / "check" / f"mask_{k:02d}.tiff"},
                                   fmt="raw16", group=folder, light=folder, exposure=exp, prompt=prompt,
                                   label=f"[{folder} {len(names) + 1 + j}/{n_shots}] check: mask_{k:02d}"))
-    desc = ", ".join(f"{f} {nm:g} nm @ {exp:.0f} us" for f, nm, exp in lasers)
+        if use_auto:     # one exposure for the whole laser, found on its white frame (the brightest)
+            shots[first]["auto"] = auto_spec(session, [N_PATTERNS], label=f"{folder} laser, white frame")
+    desc = ", ".join(f"{f} {nm:g} nm @ " + ("auto" if use_auto else f"{exp:.0f} us") for f, nm, exp in lasers)
     has_check = any(l[0] == check_laser for l in lasers)
     log(f"Calibration capture: {desc} - {len(shots)} frames"
         + (" (incl. 4 orientation-check frames)" if has_check else f" (no check frames: those come with {check_laser})")
@@ -299,6 +450,16 @@ def calibrate_capture(session, rig, ui, log=print, laser=None):
         (cap / folder / "patterns.json").write_text(json.dumps(
             {"incomplete": True, "started": _now(), "nm": nm, "exposure_us": exp, "flip_patterns_x": flip}, indent=2))
     run_shots(rig, shots, ui, log)
+    found = {}                               # exposures actually used (auto may have changed them)
+    for folder, nm, exp in lasers:
+        found[folder] = next(s["exposure"] for s in shots if s["group"] == folder)
+    lasers = [(f, nm, found[f]) for f, nm, _ in lasers]
+    if use_auto:                             # remember them in session.json (the Calibrate rows)
+        session.reload()
+        for l in session.settings["calibration"]["lasers"]:
+            if l[0] in found:
+                l[2] = found[l[0]]
+        session.save()
     if any(s["save"]["basler"].parent.name == "check" for s in shots):
         (cap / "check" / "scale.json").write_text(json.dumps({"pixel_scale": PIXEL_SCALE,
                                                               "masks_flipped_x": slm_flip}))
@@ -309,6 +470,8 @@ def calibrate_capture(session, rig, ui, log=print, laser=None):
         entry = {"nm": nm, "exposure_us": exp, "flip_patterns_x": flip, "captured": _now(),
                  "patterns_folder": str(pat_dir), "settle_ms": session.settings["settle_ms"],
                  "saturated_frames": sat, "check_frames": folder == check_laser,
+                 "exposure_source": _auto_record(shots, folder)[0],
+                 "auto_exposure": _auto_record(shots, folder)[1],
                  "basler_settings": next((s.get("basler_settings") for s in shots
                                           if s["group"] == folder and "basler_settings" in s), None)}
         (cap / folder / "patterns.json").write_text(json.dumps(entry, indent=2))
@@ -470,7 +633,7 @@ def calibrate_check(session, log=print):
 
 
 # =============================================================== CAPTURE
-def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
+def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None, auto=None):
     sd = session.scene_dir(scene)
     if (sd / "manifest.json").exists():
         raise StageError(f"Scene '{scene}' already exists in this session - pick a new name.")
@@ -510,6 +673,11 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
                                 "blackfly": (cap / "rgb" / f"rgb_{r['frame']:02d}.png") if bf else None}))
     if s["capture"]["zero_at_end"]:
         shots.append(dict(mask_index=0, save={"basler": cap / "zero_end.tiff"}, fmt="raw16", group="scene", exposure=exp))
+    use_auto = _want_auto(session, auto)
+    if use_auto:         # one exposure for the whole scan: the brightest tested mask stays unsaturated
+        idx = scene_test_indices(session, len(plan))
+        shots[0]["auto"] = auto_spec(session, idx, idx if bf else None, keep=True,
+                                     label=f"{len(idx)} of the {len(plan)} scan masks")
     bf_settings = None                      # what the Blackfly reports (gamma / white balance)
     if bf and getattr(rig, "blackfly", None) is not None and hasattr(rig.blackfly, "raw_settings"):
         try:
@@ -518,9 +686,19 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
                 log("WARNING: Blackfly gamma or white balance is ON - its frames will not be raw.")
         except Exception as e:  # noqa
             bf_settings = {"error": str(e)}
-    log(f"Scene capture '{scene}': {len(shots)} frames at {exp:.0f} us. Keep the scene completely still.")
+    log(f"Scene capture '{scene}': {len(shots)} frames at "
+        + ("an exposure found automatically first" if use_auto else f"{exp:.0f} us")
+        + ". Keep the scene completely still.")
     t0 = time.time()
     run_shots(rig, shots, ui, log)
+    exp = shots[0]["exposure"]
+    src, auto_res = _auto_record(shots, "scene")
+    if use_auto:
+        session.reload()
+        session.settings["capture"]["exposure_us"] = exp
+        if auto_res and auto_res.get("blackfly"):
+            session.settings["blackfly"]["exposure_us"] = auto_res["blackfly"]["exposure_us"]
+        session.save()
 
     zeros = [read_basler(cap / n) for n in ("zero_start.tiff", "zero_end.tiff") if (cap / n).is_file()]
     drift = None
@@ -533,7 +711,9 @@ def capture_scene(session, rig, scene, ui, log=print, use_blackfly=None):
 
     manifest = {
         "scene": scene, "session": session.name, "captured": _now(), "seconds": round(time.time() - t0),
-        "exposure_us": exp, "settle_ms": s["settle_ms"], "pixel_scale": PIXEL_SCALE,
+        "exposure_us": exp, "exposure_source": src, "auto_exposure": auto_res,
+        "blackfly_exposure_us": getattr(rig, "blackfly_exposure_us", None) if bf else None,
+        "settle_ms": s["settle_ms"], "pixel_scale": PIXEL_SCALE,
         "pixel_values": "raw 12-bit x 16 (0-65520) in uint16 TIFF - divide by pixel_scale",
         "bright_fraction": round(float(np.median([x["bright"] for x in shots[1:-1] or shots])), 3),
         "table": str(session.table), "table_md5": _md5(session.table) if session.table.is_file() else None,
@@ -565,7 +745,7 @@ def default_sparse_mask(session):
     return session.lab_path("scan_masks") / "mask_00.png"
 
 
-def capture_position(session, rig, scene, ui, log=print, mask_path=None, use_blackfly=None):
+def capture_position(session, rig, scene, ui, log=print, mask_path=None, use_blackfly=None, auto=None):
     """One position of a moving object: the sparse mask (with a Blackfly frame), then the
     black mask (Basler only), at the same exposure, back to back. Saved in
     scenes/<scene>/positions/pos_NN/: mask.tiff, zero.tiff (raw 12-bit), rgb.png + rgb.raw,
@@ -589,19 +769,35 @@ def capture_position(session, rig, scene, ui, log=print, mask_path=None, use_bla
     shots = [dict(mask_index=0, fmt="raw16", group="pos", exposure=exp,
                   save={"basler": pd / "mask.tiff", "blackfly": (pd / "rgb.png") if bf else None}),
              dict(mask_index=1, fmt="raw16", group="pos", exposure=exp, save={"basler": pd / "zero.tiff"})]
+    use_auto = _want_auto(session, auto)
+    if use_auto:         # mask and black frame share the exposure found on the mask
+        shots[0]["auto"] = auto_spec(session, [0], [0] if bf else None, keep=True,
+                                     label=f"sparse mask {mask_path.name}")
     bf_settings = None
     if bf and getattr(rig, "blackfly", None) is not None and hasattr(rig.blackfly, "raw_settings"):
         try:
             bf_settings = json.loads(json.dumps(rig.blackfly.raw_settings(), default=str))
         except Exception as e:  # noqa
             bf_settings = {"error": str(e)}
-    log(f"Position {k} of '{scene}': {mask_path.name} then black, {exp:.0f} us. Keep the object still.")
+    log(f"Position {k} of '{scene}': {mask_path.name} then black, "
+        + ("exposure found automatically first" if use_auto else f"{exp:.0f} us") + ". Keep the object still.")
     t0 = time.time()
     run_shots(rig, shots, ui, log)
+    exp = shots[0]["exposure"]
+    src, auto_res = _auto_record(shots, "pos")
+    if use_auto:
+        session.reload()
+        session.settings["capture"]["exposure_us"] = exp
+        if auto_res and auto_res.get("blackfly"):
+            session.settings["blackfly"]["exposure_us"] = auto_res["blackfly"]["exposure_us"]
+        session.save()
     m = read_basler(pd / "mask.tiff", PIXEL_SCALE)
     z = read_basler(pd / "zero.tiff", PIXEL_SCALE)
     rec = {"position": k, "scene": scene, "session": session.name, "captured": _now(),
-           "seconds": round(time.time() - t0, 1), "exposure_us": exp, "settle_ms": s["settle_ms"],
+           "seconds": round(time.time() - t0, 1), "exposure_us": exp, "exposure_source": src,
+           "auto_exposure": auto_res,
+           "blackfly_exposure_us": getattr(rig, "blackfly_exposure_us", None) if bf else None,
+           "settle_ms": s["settle_ms"],
            "mask_file": str(mask_path), "pixel_scale": PIXEL_SCALE,
            "pixel_values": "raw 12-bit x 16 (0-65520) in uint16 TIFF - divide by pixel_scale",
            "mask_mean": float(m.mean()), "zero_mean": float(z.mean()), "bright_fraction": round(shots[0]["bright"], 3),

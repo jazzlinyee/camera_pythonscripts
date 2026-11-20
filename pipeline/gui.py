@@ -614,8 +614,10 @@ class App:
         self._adj_widgets = (self.adj_entry, self.adj_apply_btn, self.adj_done)
         self._adj_enable(False)
 
-        opts = ttk.Frame(f)
-        opts.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        optwrap = ttk.Frame(f)
+        optwrap.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        opts = ttk.Frame(optwrap)
+        opts.pack(anchor="w")
         ttk.Label(opts, text="Orientation-check frames with:").pack(side="left")
         self.check_var = tk.StringVar()
         self.check_box = ttk.Combobox(opts, textvariable=self.check_var, width=8, state="readonly")
@@ -627,6 +629,13 @@ class App:
         ttk.Checkbutton(opts, text="Flip Gray-code patterns left-right (same for all lasers; "
                                    "always flipped while 'Flip masks' is on)",
                         variable=self.flip_var).pack(side="left")
+        # one setting for every capture (also on the Capture tab): auto exposure first
+        self.auto_var = tk.BooleanVar(value=False)
+        opts2 = ttk.Frame(optwrap)
+        opts2.pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(opts2, text="Find the exposure automatically before each capture "
+                                    "(longest without saturation, on each laser's white frame)",
+                        variable=self.auto_var).pack(side="left")
 
         btns = ttk.Frame(f)
         btns.grid(row=4, column=0, sticky="we", pady=10)
@@ -669,7 +678,7 @@ class App:
             w.destroy()
         self.laser_rows = []
         self._laser_names = {}
-        for c, text in enumerate(("Laser", "nm", "Basler exposure (µs)", "Status", "", "")):
+        for c, text in enumerate(("Laser", "nm", "Basler exposure (µs)", "Status", "", "", "")):
             ttk.Label(self.laser_frame, text=text, foreground=self.C["muted"]).grid(row=0, column=c, sticky="w", padx=(0, 10))
         for r, (folder, nm, exp) in enumerate(self.session.settings["calibration"]["lasers"], 1):
             nm_var, exp_var = tk.StringVar(value=f"{nm:g}"), tk.StringVar(value=f"{exp:.0f}")
@@ -681,8 +690,10 @@ class App:
             status.grid(row=r, column=3, sticky="w", padx=(0, 10))
             ttk.Button(self.laser_frame, text="Set exposure",
                        command=lambda fo=folder: self._adj_start(fo)).grid(row=r, column=4, sticky="w", pady=1, padx=(0, 4))
+            ttk.Button(self.laser_frame, text="Auto",
+                       command=lambda fo=folder: self.run_auto("laser", fo)).grid(row=r, column=5, sticky="w", pady=1, padx=(0, 4))
             ttk.Button(self.laser_frame, text=f"Capture {folder}",
-                       command=lambda fo=folder: self.run_cal_capture(fo)).grid(row=r, column=5, sticky="w", pady=1)
+                       command=lambda fo=folder: self.run_cal_capture(fo)).grid(row=r, column=6, sticky="w", pady=1)
             self.laser_rows.append((folder, nm_var, exp_var, status))
             self._laser_names[folder] = name
         names = [r[0] for r in self.laser_rows]
@@ -824,6 +835,9 @@ class App:
         ttk.Entry(f, textvariable=self.cap_exp, width=12).grid(row=2, column=1, sticky="w")
         self.bf_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text="Also capture RGB guide camera (Blackfly)", variable=self.bf_var).grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Button(f, text="Auto", command=lambda: self.run_auto("scene")).grid(row=2, column=2, sticky="w")
+        ttk.Checkbutton(f, text="Find the exposure automatically before capturing",
+                        variable=self.auto_var).grid(row=3, column=2, columnspan=2, sticky="w")
         ttk.Button(f, text="Capture scene", command=self.run_capture).grid(row=4, column=0, sticky="w", pady=10)
         self.cap_canvas = tk.Canvas(f, bg="black", width=640, height=430, highlightthickness=0)
         self.cap_canvas.grid(row=5, column=0, columnspan=4, sticky="nw")
@@ -849,8 +863,10 @@ class App:
         # value and pressing Enter (or leaving the box) sets the camera to it
         self.cap_exp_entry.bind("<Return>", lambda e: self._apply_cap_exposure())
         self.cap_exp_entry.bind("<FocusOut>", lambda e: self._apply_cap_exposure(quiet=True))
+        ttk.Button(bar, text="Auto", command=lambda: self.run_auto("scene")).pack(side="left", padx=(0, 4))
         self.bf_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="+ Blackfly RGB", variable=self.bf_var).pack(side="left", padx=8)
+        ttk.Checkbutton(bar, text="Auto exposure first", variable=self.auto_var).pack(side="left", padx=(0, 8))
         ttk.Button(bar, text="Capture scene (zero + 56 masks + zero)", command=self.run_capture).pack(side="left", padx=4)
         ttk.Button(bar, text="Live window ⧉", command=self.open_live_window).pack(side="left", padx=4)
         self.cap_info = ttk.Label(bar, text="", foreground=self.C["muted"])
@@ -868,6 +884,7 @@ class App:
         self.pos_mask_label = ttk.Label(bar2, text="mask_00", foreground=self.C["text2"])
         self.pos_mask_label.pack(side="left")
         ttk.Button(bar2, text="Choose…", command=self._pos_choose_mask).pack(side="left", padx=(4, 8))
+        ttk.Button(bar2, text="Auto exposure", command=lambda: self.run_auto("position")).pack(side="left", padx=4)
         ttk.Button(bar2, text="Capture position (mask + black)", command=self.run_position).pack(side="left", padx=4)
         ttk.Button(bar2, text="Export positions", command=self.run_pos_export).pack(side="left", padx=4)
         self.pos_info = ttk.Label(bar2, text="", foreground=self.C["muted"])
@@ -1141,6 +1158,7 @@ class App:
                 pass
         self.settle_var.set(str(s["settle_ms"]))
         self.flip_var.set(bool(s["calibration"].get("flip_patterns_x", False)))
+        self.auto_var.set(bool(s.get("auto_exposure", {}).get("before_capture", False)))
         if hasattr(self, "slm_flip_var"):               # the session's SLM flip -> top bar + camera GUI
             on = bool(s["slm"].get("flip_x", True))
             self.slm_flip_var.set(on)
@@ -1193,6 +1211,7 @@ class App:
             s["blackfly"]["enabled"] = bool(self.bf_var.get())
             if hasattr(self, "slm_flip_var"):
                 s["slm"]["flip_x"] = bool(self.slm_flip_var.get())
+            s.setdefault("auto_exposure", {})["before_capture"] = bool(self.auto_var.get())
         except ValueError:
             messagebox.showerror("Settings", "Wavelengths, exposures and settle time must be numbers."); return False
         self.session.save()
@@ -1396,7 +1415,53 @@ class App:
         if msg:
             self._write_log(msg, "ok" if ok else "bad")
         self.log_dest = "main"
+        if getattr(self, "_refresh_exp_after", False):
+            self._refresh_exp_after = False
+            self._refresh_exposure_boxes()
         self.refresh_status()
+
+    def _refresh_exposure_boxes(self):
+        """Show exposures that a capture / auto exposure stored in session.json."""
+        if self.session is None:
+            return
+        self.session.reload()
+        s = self.session.settings
+        for folder, nm_var, exp_var, _ in self.laser_rows:
+            e = next((l[2] for l in s["calibration"]["lasers"] if l[0] == folder), None)
+            if e is not None:
+                exp_var.set(f"{e:.0f}")
+        self.cap_exp.set(f"{s['capture']['exposure_us']:.0f}")
+
+    def run_auto(self, kind, laser=None):
+        """The Auto buttons: find the longest unsaturated exposure, set it on the camera(s)
+        and in the exposure box (kind = 'laser' / 'scene' / 'position')."""
+        if kind != "laser" and not self._apply_cap_exposure():
+            return
+        if not self.session or not self.save_form() or not self._need_rig():
+            return
+        what = {"laser": f"Auto exposure ({laser})", "scene": "Auto exposure (full scan)",
+                "position": "Auto exposure (moving object)"}[kind]
+        if not self._start(what, dest="cal" if kind == "laser" else "main"):
+            return
+        self._refresh_exp_after = True
+        self.live_on = False
+        self.rig.settle_s = self.session.settings["settle_ms"] / 1000
+
+        def work():
+            import stages
+            try:
+                r = stages.find_exposure(self.session, self.rig, self.ui, log=self.log, kind=kind, laser=laser,
+                                         mask_path=self.pos_mask if kind == "position" else None,
+                                         use_blackfly=self.bf_var.get())
+                b, f = r["basler"], r.get("blackfly")
+                msg = (f"Basler exposure set to {b['exposure_us']:.0f} µs"
+                       + (f" (brightest {b['brightness']:.0%})" if b["brightness"] is not None else "")
+                       + (f"; Blackfly {f['exposure_us']:.0f} µs" if f else "")
+                       + "".join(f". NOTE: {x['note']}" for x in (b, f) if x and x["note"]))
+                self.q.put(("done", True, msg))
+            except Exception as e:  # noqa
+                self.q.put(("done", False, f"ERROR: {e}"))
+        threading.Thread(target=work, daemon=True).start()
 
     def stop(self):
         self.ui.stop_flag.set()
@@ -1413,12 +1478,14 @@ class App:
         if not messagebox.askokcancel(
                 f"Capture {folder}",
                 f"Capture the 46 Gray-code patterns under the {folder} laser ({nm:g} nm){extra}, "
-                f"at {exp:.0f} µs.\n\n"
+                + (f"at an exposure found automatically on its white frame (starting from {exp:.0f} µs).\n\n"
+                   if self.auto_var.get() else f"at {exp:.0f} µs.\n\n")
                 + ("Patterns: FLIPPED left-right.\n\n" if self.flip_var.get() else "")
                 + "Other lasers' captures are kept. Start?"):
             return
         if not self._start(f"Capture {folder}", dest="cal"):
             return
+        self._refresh_exp_after = True
         self.live_on = False
         self.rig.settle_s = self.session.settings["settle_ms"] / 1000
 
@@ -1472,6 +1539,7 @@ class App:
         k = self._pos_count(scene) + 1
         if not self._start(f"Position {k} of {scene}"):
             return
+        self._refresh_exp_after = True
         self.live_on = False
         self.rig.settle_s = self.session.settings["settle_ms"] / 1000
 
@@ -1507,6 +1575,7 @@ class App:
                 return
         if not self._start(f"Capture {scene}"):
             return
+        self._refresh_exp_after = True
         self.live_on = False
         self.rig.settle_s = self.session.settings["settle_ms"] / 1000
 

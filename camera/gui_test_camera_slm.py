@@ -98,7 +98,9 @@ docstring for why that matters).
 """
 
 import json
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -112,6 +114,7 @@ from basler_camera import BaslerCamera
 from blackfly_camera import BlackflyCamera
 from camera_base import CameraError
 from preview_utils import array_to_photoimage
+import auto_exposure
 from slm_display import SLMDisplay, SLMError
 from test_on_hardware_slm import HEIGHT, WIDTH, make_test_masks
 
@@ -125,6 +128,12 @@ SLM_OPENS_WHITE = True
 # SLM panel turns it off/on. Saved mask copies (capture_masks.json) are in the original
 # orientation; their "flipped_x" says whether the SLM showed them flipped.
 SLM_FLIP_X = True
+
+# "Auto Exposure" button (added 2026-11-20): the longest exposure with at most 0.01 % of the
+# pixels at full scale, for whatever is on the SLM. Limits per camera, in microseconds.
+AUTO_EXPOSURE_MIN_US = 20
+AUTO_EXPOSURE_MAX_US = {"basler": 2_000_000, "blackfly": 1_000_000}
+AUTO_EXPOSURE_FULL_SCALE = {"basler": 4095, "blackfly": 255}
 
 OUTPUT_DIR = Path("test_captures")
 # Characters that can't safely appear in a file name on macOS/Windows/Linux --
@@ -279,7 +288,12 @@ class App:
         self.set_exposure_btn.grid(row=2, column=2, sticky="w")
 
         self.exposure_label = ttk.Label(cam_frame, text="Current exposure: --")
-        self.exposure_label.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        self.exposure_label.grid(row=3, column=0, columnspan=2, sticky="w", **pad)
+        self.auto_exposure_btn = ttk.Button(
+            cam_frame, text="Auto Exposure", command=self.auto_exposure, state="disabled"
+        )
+        self.auto_exposure_btn.grid(row=3, column=2, sticky="w")
+        self._auto_exp_busy = False
 
         ttk.Label(cam_frame, text="File name:").grid(row=4, column=0, sticky="e")
         self.filename_entry = ttk.Entry(cam_frame, width=26)
@@ -778,6 +792,8 @@ class App:
         self.open_cam_btn.configure(state="disabled" if is_open else "normal")
         self.close_cam_btn.configure(state="normal" if is_open else "disabled")
         self.set_exposure_btn.configure(state="normal" if is_open else "disabled")
+        if not getattr(self, "_auto_exp_busy", False):
+            self.auto_exposure_btn.configure(state="normal" if is_open else "disabled")
         self.capture_btn.configure(state="normal" if is_open else "disabled")
         if is_open:
             self.refresh_exposure()
@@ -787,10 +803,109 @@ class App:
         both_open = all(c is not None for c in self.cams.values())
         self.capture_both_btn.configure(state="normal" if both_open else "disabled")
 
+    def auto_exposure(self):
+        """Find the longest exposure without oversaturation for the selected camera and
+        whatever is on the SLM now, then set it (added 2026-11-20). Runs in the background;
+        live views pause meanwhile and come back afterwards."""
+        choice = self.cam_choice.get()
+        cam = self.cams[choice]
+        if cam is None or self._auto_exp_busy:
+            return
+        if self._auto_running:
+            self.log("Stop Auto Cycle first.")
+            return
+        if self.slm is None:
+            self.log("Note: the SLM is closed - testing whatever light reaches the camera now.")
+        paused = [k for k, v in self.live_vars.items() if v.get() and self.cams.get(k) is not None]
+        for k in paused:
+            self._stop_live(k, reset_checkbox=True)
+        self._auto_exp_busy = True
+        self.auto_exposure_btn.configure(state="disabled", text="Searching...")
+        full = AUTO_EXPOSURE_FULL_SCALE[choice]
+        try:
+            start = float(cam.get_exposure_time())
+        except (CameraError, TypeError, ValueError):
+            start = 10000.0
+        self.log(f"Auto exposure ({choice}): longest exposure with at most 0.01% of pixels at {full}...")
+
+        def grab(us):
+            # a frame that started exposing before the change is thrown away (exposure-aware)
+            cam.set_exposure_time(us)
+            t_set, exp_s = time.time(), us / 1e6
+            deadline = t_set + 4 * exp_s + 10
+            discarded = 0
+            while time.time() < deadline:
+                f = cam.grab_preview(timeout_ms=int(exp_s * 2000) + 1000, downsample=1)
+                if f is None:
+                    continue
+                if time.time() - exp_s - 0.15 >= t_set and discarded >= 1:
+                    return f
+                discarded += 1
+            raise CameraError("timed out waiting for a frame")
+
+        # the search runs in a thread; it only talks to the window through this queue,
+        # which the Tk thread empties every 100 ms (_auto_exposure_poll)
+        self._ae_queue = queue.Queue()
+
+        def work():
+            try:
+                res = auto_exposure.search(
+                    grab, start, full, min_us=AUTO_EXPOSURE_MIN_US, max_us=AUTO_EXPOSURE_MAX_US[choice],
+                    log=lambda m: self._ae_queue.put(("log", m)), name=choice)
+                err = None
+            except Exception as e:  # noqa: BLE001
+                res, err = None, e
+            self._ae_queue.put(("done", (choice, start, res, err, paused)))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(100, self._auto_exposure_poll)
+
+    def _auto_exposure_poll(self):
+        try:
+            while True:
+                kind, payload = self._ae_queue.get_nowait()
+                if kind == "log":
+                    self.log(payload)
+                else:
+                    self._auto_exposure_done(*payload)
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(100, self._auto_exposure_poll)
+
+    def _auto_exposure_done(self, choice, start, res, err, paused):
+        cam = self.cams.get(choice)
+        us = res["exposure_us"] if res else start
+        if cam is not None:
+            try:
+                cam.set_exposure_time(us)
+                self._flush_stale_frame(choice)
+            except CameraError as e:
+                self.log(f"Could not set exposure: {e}")
+        if err is not None:
+            self.log(f"Auto exposure failed ({choice}): {err} - exposure left at {start:g} us.")
+        else:
+            self.log(f"Auto exposure ({choice}): set to {us:g} us"
+                     + (f", brightest {res['brightness']:.0%}" if res["brightness"] is not None else "")
+                     + (f". NOTE: {res['note']}" if res["note"] else "."))
+        if self.cam_choice.get() == choice:
+            self.exposure_entry.delete(0, "end")
+            self.exposure_entry.insert(0, f"{us:g}")
+        self._auto_exp_busy = False
+        self.auto_exposure_btn.configure(text="Auto Exposure")
+        self._refresh_camera_buttons()
+        for k in paused:
+            if self.cams.get(k) is not None:
+                self.live_vars[k].set(True)
+                self._on_live_toggle(k)
+
     def set_exposure(self):
         choice = self.cam_choice.get()
         cam = self.cams[choice]
         if cam is None:
+            return
+        if self._auto_exp_busy:
+            self.log("Wait for Auto Exposure to finish.")
             return
         raw = self.exposure_entry.get().strip()
         try:
@@ -1023,6 +1138,9 @@ class App:
     def _capture_one(self, choice: str, suffix_camera: bool = False, extra: str = ""):
         cam = self.cams[choice]
         if cam is None:
+            return None
+        if getattr(self, "_auto_exp_busy", False):
+            self.log("Wait for Auto Exposure to finish before capturing.")
             return None
         try:
             path = self._next_capture_path(choice, suffix_camera=suffix_camera, extra=extra)

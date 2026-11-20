@@ -85,6 +85,7 @@ class SimRig:
         self.scene = Scene()
         self.masks, self.cur = [np.zeros((SLM_H, SLM_W), np.uint8)], 0
         self.exposure_us = 100000.0
+        self.blackfly_exposure_us = 20000.0
         self.light = "scene"            # "scene" or a laser folder name ("Blue"/"Green"/"Red")
         self.rng = np.random.default_rng(0)
         self._maps = {}
@@ -110,6 +111,9 @@ class SimRig:
         self.exposure_us = float(us)
         self._cache = None
 
+    def set_blackfly_exposure(self, us):
+        self.blackfly_exposure_us = float(us)
+
     def set_light(self, light):
         """Simulator only: which light is on (the real rig asks the user to switch lasers)."""
         self.light = light
@@ -121,7 +125,7 @@ class SimRig:
 
     def grab_blackfly(self):
         rgb = np.stack([self.scene.band(b) for b in (25, 15, 5)], -1)  # B,G,R order for BGR
-        rgb = cv2.resize(rgb, (720, 540)) * 200
+        rgb = cv2.resize(rgb, (720, 540)) * 200 * (self.blackfly_exposure_us / 20000.0)
         bayer = np.zeros((540, 720), np.float32)                       # RG Bayer mosaic
         bayer[0::2, 0::2] = rgb[0::2, 0::2, 2]
         bayer[0::2, 1::2] = rgb[0::2, 1::2, 1]

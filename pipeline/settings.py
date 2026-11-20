@@ -45,6 +45,13 @@ DEFAULTS = {
     # flip_x: every mask is shown flipped left-right on the SLM (2026-11-10). In the GUI this
     # follows the "Flip masks" checkbox (top bar / camera GUI's SLM panel).
     "slm": {"monitor_index": None, "mirrored": False, "flip_x": True},
+    # Automatic exposure (2026-11-20): the longest exposure with at most max_saturated of the
+    # pixels at full scale, brightest parts at about `target`. before_capture = the "Find
+    # exposure before capturing" checkbox. scene_test_masks = how many of the 56 scan masks
+    # are tested for a full scan (spread evenly; the brightest decides).
+    "auto_exposure": {"before_capture": False, "max_saturated": 0.0001, "target": 0.95,
+                      "min_us": 20, "max_us": 2000000, "blackfly_max_us": 1000000,
+                      "scene_test_masks": 8},
     "basler": {"serial": None, "gain_db": 0.0},
     "blackfly": {"enabled": True, "serial": None, "gain_db": 0.0, "exposure_us": 20000},
     # Time to wait after changing the SLM image before grabbing (one stale frame is

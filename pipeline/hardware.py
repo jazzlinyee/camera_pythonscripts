@@ -9,6 +9,7 @@ Interface used by the stages and the GUI:
     rig.load_masks([arrays...])      rig.show(i)          # SLM; call from the main (Tk) thread
     rig.flip_x                       # True when masks are shown flipped left-right
     rig.set_exposure(us)             rig.exposure_us
+    rig.set_blackfly_exposure(us)    rig.blackfly_exposure_us     # Blackfly (RGB) exposure
     rig.grab_basler()  -> uint16 raw 12-bit frame taken entirely AFTER the last show()
     rig.grab_blackfly()-> raw Bayer (RG) uint8 frame, same guarantee
     rig.live_frame(downsample) -> latest Basler frame (raw 12-bit) or None, for live view
@@ -146,6 +147,12 @@ class RealRig(_Base):
         return self._wait_clean(lambda t: self.blackfly.grab_preview(timeout_ms=t, downsample=1),
                                 self.blackfly_exposure_us)
 
+    def set_blackfly_exposure(self, us):
+        if self.blackfly is not None:
+            self.blackfly.set_exposure_time(float(us))
+            self.blackfly_exposure_us = float(us)
+            self._t_show = time.time()       # frames from before the change are not used
+
     def live_frame(self, downsample=8):
         if not self._lock.acquire(blocking=False):
             return None          # a capture is using the camera
@@ -195,6 +202,8 @@ class LabGuiRig(_Base):
             p.append("open the Basler (top bar: Basler → Open)")
         if getattr(self.lab, "_auto_running", False):
             p.append("stop Auto Cycle (2 Capture tab)")
+        if getattr(self.lab, "_auto_exp_busy", False):
+            p.append("wait for the camera GUI's Auto Exposure to finish")
         return p
 
     def open(self, blackfly=True):
@@ -305,6 +314,18 @@ class LabGuiRig(_Base):
                              self.blackfly_exposure_us)
         self._preview("blackfly", f)
         return f
+
+    def set_blackfly_exposure(self, us):
+        if self.blackfly is not None:
+            self.blackfly.set_exposure_time(float(us))
+            self.blackfly_exposure_us = float(us)
+            self._t_show = time.time()
+
+    def keep_exposure(self, us):
+        """Leave the Basler at `us` after the sequence (found by auto exposure) instead of
+        restoring the exposure it had before."""
+        if self._saved is not None:
+            self._saved["exposure"] = float(us)
 
     def live_frame(self, downsample=8):
         return None                 # the lab GUI has its own live view
