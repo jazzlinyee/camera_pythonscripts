@@ -1,24 +1,25 @@
 """
 auto_exposure.py - find the longest exposure that does not oversaturate (added 2026-11-20).
 
-Used by the camera GUI's "Auto exposure" button and by the pipeline (Auto buttons and the
-"Find exposure before capturing" option). It only needs a function that takes an exposure,
-sets it on the camera and returns a fresh frame (or a list of frames, e.g. one per mask);
-it never talks to a camera itself.
+Used by the camera GUI's "Auto Exposure" button and by the pipeline (Auto buttons and the
+"Find the exposure automatically before each capture" option). It only needs a function
+that takes an exposure, sets it on the camera and returns a fresh frame (or a list of
+frames, e.g. one per mask); it never talks to a camera itself.
 
-"Not oversaturated" = at most `max_saturated` of the pixels (default 0.01 %, so a few hot
-pixels don't count) are at full scale (4095 for the 12-bit Basler, 255 for the 8-bit
-Blackfly). The aim is to put the brightest parts at `target` (default 95 %) of full scale.
+"Oversaturated" = more than `max_saturated` of the pixels (default 0.01 %, so a few hot
+pixels don't count) at full scale: 4095 for the 12-bit Basler, 255 for the 8-bit Blackfly.
+Those are the pixels the Live window paints red.
 
-How it searches (usually 3-8 frames):
+Goal (changed 2026-11-20 at Rika's request): the exposure just before parts turn red, not
+a safety margin below it. How it searches (usually 5-9 frames):
   1. Take a frame at the starting exposure.
   2. Saturated -> halve the exposure until it is not.
-  3. Not saturated -> brightness grows in proportion to exposure, so jump straight to
-     exposure * target / brightness.
-  4. When a too-long exposure is known, never go past halfway to it (bisection), and stop when
-     the brightest parts are close to the target or the gap is under 3 %.
-The result is always an exposure whose frame was actually seen to be NOT saturated (or the
-shortest allowed one, with a note, if even that saturates).
+  3. Not saturated -> jump to where the brightest parts should just reach full scale
+     (brightness grows in proportion to exposure), at least 5 % further.
+  4. Once one exposure is known to be fine and a longer one to saturate, bisect between them
+     until they are less than 2 % apart, and use the longer one that did NOT saturate.
+The result is always an exposure whose frame was actually seen to be not oversaturated (or
+the shortest allowed one, with a note, if even that saturates).
 """
 
 import math
@@ -26,8 +27,8 @@ import math
 import numpy as np
 
 DEFAULT_MAX_SATURATED = 1e-4      # fraction of pixels allowed at full scale (0.01 %)
-DEFAULT_TARGET = 0.95             # brightest parts at 95 % of full scale
-CLOSE_ENOUGH = 0.06               # stop when within 6 % (of full scale) below the target
+EDGE_GAP = 0.02                   # stop when "fine" and "saturated" are less than 2 % apart
+AIM = 0.99                        # where the jump in step 3 aims (fraction of full scale)
 
 
 def measure(frame, full_scale, max_saturated=DEFAULT_MAX_SATURATED):
@@ -52,8 +53,8 @@ def _worst(frames, full_scale, max_saturated):
 
 
 def search(grab, start_us, full_scale, min_us=20.0, max_us=2_000_000.0,
-           max_saturated=DEFAULT_MAX_SATURATED, target=DEFAULT_TARGET, max_steps=12,
-           log=print, stopped=lambda: False, name="camera"):
+           max_saturated=DEFAULT_MAX_SATURATED, max_steps=16, log=print,
+           stopped=lambda: False, name="camera", **_ignored):
     """Find the longest exposure (us) whose frame is not oversaturated.
 
     grab(exposure_us) -> frame or list of frames, taken entirely at that exposure.
@@ -78,24 +79,22 @@ def search(grab, start_us, full_scale, min_us=20.0, max_us=2_000_000.0,
             if exp <= min_us:
                 note = f"saturated even at the shortest allowed exposure ({min_us:g} us)"
                 break
-            new = (good[0] + bad) / 2 if good else exp / 2
+        elif good is None or exp > good[0]:
+            good = (exp, level, sat)
+        if good and good[0] >= max_us:
+            note = f"still only {good[1]:.0%} bright at the longest allowed exposure ({max_us:,.0f} us)"
+            break
+        if good and bad and bad / good[0] <= 1 + EDGE_GAP:
+            break                                     # found the edge
+        if good is None:
+            new = exp / 2                             # everything so far saturated
+        elif bad is None:
+            g_exp, g_level = good[0], good[1]
+            jump = g_exp * AIM / g_level if g_level > 0.005 else g_exp * 8
+            new = max(jump, g_exp * 1.05)             # always probe further until it saturates
         else:
-            if good is None or exp > good[0]:
-                good = (exp, level, sat)
-            if level >= target - CLOSE_ENOUGH:
-                break
-            if exp >= max_us:
-                note = f"still only {level:.0%} bright at the longest allowed exposure ({max_us:,.0f} us)"
-                break
-            new = exp * target / level if level > 0.005 else exp * 8
-            if bad is not None:
-                new = min(new, (exp + bad) / 2)
-        new = clamp(new)
-        if good and bad and bad / good[0] < 1.03:
-            break
-        if good and new <= good[0] * 1.005:
-            break
-        exp = new
+            new = (good[0] + bad) / 2                 # bisect
+        exp = clamp(new)
     else:
         note = note or f"stopped after {max_steps} test frames"
     if good is None:
@@ -104,8 +103,9 @@ def search(grab, start_us, full_scale, min_us=20.0, max_us=2_000_000.0,
     else:
         result = {"exposure_us": round(good[0], 1), "brightness": round(good[1], 3), "saturated": round(good[2], 6)}
     result.update(steps=steps, note=note, full_scale=full_scale, max_saturated=max_saturated,
-                  target=target, min_us=min_us, max_us=max_us)
+                  min_us=min_us, max_us=max_us, edge_gap=EDGE_GAP)
     log(f"  {name} auto exposure: using {result['exposure_us']:,.0f} us"
-        + (f" (brightest {result['brightness']:.0%})" if result["brightness"] is not None else "")
+        + (f" (brightest {result['brightness']:.0%}, just below saturation)" if result["brightness"] is not None
+           and not note else (f" (brightest {result['brightness']:.0%})" if result["brightness"] is not None else ""))
         + (f" - NOTE: {note}" if note else ""))
     return result

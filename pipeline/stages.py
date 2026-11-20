@@ -216,7 +216,7 @@ def auto_search(rig, ui, log, spec, start_us=None):
 
     out = {"basler": mod.search(grab_basler, start_us or getattr(rig, "exposure_us", None) or 100000, 4095,
                                 min_us=ae["min_us"], max_us=ae["max_us"], max_saturated=ae["max_saturated"],
-                                target=ae["target"], log=log, stopped=stopped, name="Basler"),
+                                log=log, stopped=stopped, name="Basler"),
            "blackfly": None}
     rig.set_exposure(out["basler"]["exposure_us"])
     if spec.get("keep") and hasattr(rig, "keep_exposure"):
@@ -235,7 +235,7 @@ def auto_search(rig, ui, log, spec, start_us=None):
 
         out["blackfly"] = mod.search(grab_blackfly, getattr(rig, "blackfly_exposure_us", None) or 20000, 255,
                                      min_us=ae["min_us"], max_us=ae.get("blackfly_max_us", ae["max_us"]),
-                                     max_saturated=ae["max_saturated"], target=ae["target"], log=log,
+                                     max_saturated=ae["max_saturated"], log=log,
                                      stopped=stopped, name="Blackfly")
         rig.set_blackfly_exposure(out["blackfly"]["exposure_us"])
     return out

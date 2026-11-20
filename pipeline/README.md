@@ -235,8 +235,9 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
   older calibration-only switch (`flip_patterns_x` in session.json; its Calibrate-tab checkbox
   was removed 2026-11-20) only matters with the flip off.
 - **Auto exposure** (since 2026-11-20). Finds the longest exposure where at most 0.01 % of the
-  pixels are at full scale (4095 Basler, 255 Blackfly; a few hot pixels don't count), with the
-  brightest parts at about 95 %. It usually takes 3-8 test frames.
+  pixels are at full scale (4095 Basler, 255 Blackfly; a few hot pixels don't count): the
+  exposure just before parts turn red in the Live window, within 2 %. It jumps close, then
+  bisects between "fine" and "saturated"; usually 5-10 test frames.
   - **Auto** buttons: on each laser row (tested on that laser's white Gray-code frame, the
     brightest of the set), next to the Capture tab's Basler exposure (tests 8 of the 56 scan
     masks spread evenly and keeps the brightest under the limit; also the Blackfly when
@@ -250,8 +251,8 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
     the SLM (runs in the background; live views pause meanwhile).
   - Records: `exposure_source` ("auto"/"manual") and `auto_exposure` (every test frame) in
     manifest.json / position.json / capture.json, plus `blackfly_exposure_us`.
-  - Limits and rule in session.json `"auto_exposure"`: `max_saturated` (0.0001), `target`
-    (0.95), `min_us` (20), `max_us` (2 s), `blackfly_max_us` (1 s), `scene_test_masks` (8).
+  - Limits and rule in session.json `"auto_exposure"`: `max_saturated` (0.0001), `min_us` (20),
+    `max_us` (2 s), `blackfly_max_us` (1 s), `scene_test_masks` (8).
 - **No image offset.** Every time the Basler or Blackfly opens, it is set to the full sensor:
   OffsetX/OffsetY 0, binning 1x1, maximum width/height (Basler 5472 x 3648, Blackfly 1440 x 1080;
   Basler auto-centering off). Captures were already full-sensor, so existing calibrations are
