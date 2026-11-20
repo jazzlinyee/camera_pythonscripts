@@ -220,10 +220,6 @@ class App:
             btn = ttk.Button(bar, text="Open", width=6, command=lambda k=key: self._hw_toggle(k))
             btn.pack(side="left", padx=(2, 0))
             self.hw_widgets[key] = (dot, btn)
-            if key == "slm":                 # every mask flipped left-right (2026-11-10)
-                self.slm_flip_var = tk.BooleanVar(value=True)
-                ttk.Checkbutton(bar, text="Flip masks ↔", variable=self.slm_flip_var,
-                                command=self._slm_flip_toggle).pack(side="left", padx=(6, 0))
             if key == "blackfly":            # its processing switches + what the camera reports
                 self.bf_gamma_var, self.bf_wb_var = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
                 self.bf_gamma_cb = ttk.Checkbutton(bar, text="Gamma", variable=self.bf_gamma_var,
@@ -625,10 +621,9 @@ class App:
         ttk.Label(opts, text="Settle time (ms):").pack(side="left")
         self.settle_var = tk.StringVar()
         ttk.Entry(opts, textvariable=self.settle_var, width=7).pack(side="left", padx=(4, 16))
+        # no checkbox any more (2026-11-20): the Gray codes are flipped like every mask, and
+        # session.json's older flip_patterns_x only mattered with the SLM flip off
         self.flip_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Flip Gray-code patterns left-right (same for all lasers; "
-                                   "always flipped while 'Flip masks' is on)",
-                        variable=self.flip_var).pack(side="left")
         # one setting for every capture (also on the Capture tab): auto exposure first
         self.auto_var = tk.BooleanVar(value=False)
         opts2 = ttk.Frame(optwrap)
@@ -1209,8 +1204,7 @@ class App:
             s["calibration"]["flip_patterns_x"] = bool(self.flip_var.get())
             s["capture"]["exposure_us"] = float(self.cap_exp.get())
             s["blackfly"]["enabled"] = bool(self.bf_var.get())
-            if hasattr(self, "slm_flip_var"):
-                s["slm"]["flip_x"] = bool(self.slm_flip_var.get())
+            s["slm"]["flip_x"] = True        # masks are always flipped (no checkbox since 2026-11-20)
             s.setdefault("auto_exposure", {})["before_capture"] = bool(self.auto_var.get())
         except ValueError:
             messagebox.showerror("Settings", "Wavelengths, exposures and settle time must be numbers."); return False
@@ -1480,7 +1474,7 @@ class App:
                 f"Capture the 46 Gray-code patterns under the {folder} laser ({nm:g} nm){extra}, "
                 + (f"at an exposure found automatically on its white frame (starting from {exp:.0f} µs).\n\n"
                    if self.auto_var.get() else f"at {exp:.0f} µs.\n\n")
-                + ("Patterns: FLIPPED left-right.\n\n" if self.flip_var.get() else "")
+                + "Patterns: shown flipped left-right, like every mask.\n\n"
                 + "Other lasers' captures are kept. Start?"):
             return
         if not self._start(f"Capture {folder}", dest="cal"):

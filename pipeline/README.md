@@ -221,9 +221,9 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
   auto gain or auto exposure on.
 - **Masks are flipped left-right on the SLM** (since 2026-11-10). Every mask is shown flipped:
   Gray codes, scan masks, the sparse mask, white/black, and anything shown from the camera GUI.
-  The mask files themselves are not changed. Switch: **Flip masks ↔** in the top bar (or the
-  checkbox under the camera GUI's mask list; the two follow each other), saved as
-  `"slm": {"flip_x": true}` in session.json. Masks saved with captures are in the **original
+  The mask files themselves are not changed. Always on: there is no checkbox (removed
+  2026-11-20); to turn it off, set `SLM_FLIP_X = False` in `camera/gui_test_camera_slm.py`
+  (and `"slm": {"flip_x": false}` in session.json for `pipeline.py gui --standalone`). Masks saved with captures are in the **original
   orientation** (since 2026-11-20): camera GUI copies, positions' `slm_mask.png` /
   `slm_black.png`, and a scene's `masks/` folder. The processing uses the masks as they were
   shown: a scene also gets `masks_as_shown/` (flipped copies; `frames[].mask` in manifest.json
@@ -232,7 +232,8 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
   `capture_masks.json` / `check/scale.json` record `masks_flipped_x`. (Captures from 11-10 to
   11-20 saved the flipped copies instead; they are still read correctly.) Gray codes are flipped once
   (never twice) and the table is un-flipped as before, so it stays in real SLM columns. The
-  older calibration-only switch (`flip_patterns_x`, Calibrate tab) only matters with the flip off.
+  older calibration-only switch (`flip_patterns_x` in session.json; its Calibrate-tab checkbox
+  was removed 2026-11-20) only matters with the flip off.
 - **Auto exposure** (since 2026-11-20). Finds the longest exposure where at most 0.01 % of the
   pixels are at full scale (4095 Basler, 255 Blackfly; a few hot pixels don't count), with the
   brightest parts at about 95 %. It usually takes 3-8 test frames.

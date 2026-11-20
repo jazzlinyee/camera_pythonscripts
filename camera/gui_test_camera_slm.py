@@ -124,8 +124,8 @@ from test_on_hardware_slm import HEIGHT, WIDTH, make_test_masks
 SLM_OPENS_WHITE = True
 
 # Every mask is shown flipped left-right on the SLM (added 2026-11-10). The mask files are
-# not changed; only what goes on the SLM is. The "Flip masks left-right" checkbox in the
-# SLM panel turns it off/on. Saved mask copies (capture_masks.json) are in the original
+# not changed; only what goes on the SLM is. Always on (its checkbox was removed
+# 2026-11-20); set this to False to turn it off. Saved mask copies (capture_masks.json) are in the original
 # orientation; their "flipped_x" says whether the SLM showed them flipped.
 SLM_FLIP_X = True
 
@@ -373,11 +373,8 @@ class App:
         self.mask_tree.configure(yscrollcommand=tree_scroll.set)
         self.mask_tree.bind("<Double-Button-1>", self._on_mask_tree_double_click)
 
+        # always on (the checkbox was removed 2026-11-20); change SLM_FLIP_X to turn it off
         self.slm_flip_var = tk.BooleanVar(value=SLM_FLIP_X)
-        ttk.Checkbutton(
-            slm_frame, text="Flip masks left-right (all masks, as shown on the SLM)",
-            variable=self.slm_flip_var, command=self._on_slm_flip_toggle,
-        ).grid(row=2, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 4))
 
         auto_wrap = ttk.Frame(self.top_section)
         auto_wrap.grid(row=0, column=2, sticky="nsew", **pad)
