@@ -8,6 +8,8 @@ Coded-aperture hyperspectral pipeline: calibrate -> capture -> cube.
     python pipeline.py calibrate check   <session>       does the table match the hardware's orientation?
     python pipeline.py capture <session> <scene>         all-zero + 56 scan masks of a scene
     python pipeline.py cube    <session> <scene> [--force]
+    python pipeline.py checkerboard <session>            white mask: Basler + Blackfly frame of the checkerboard
+    python pipeline.py guide   <session>                 guide_calib.ipynb -> calibration/guide/guide_to_slm.npz
     python pipeline.py gui                               camera GUI + pipeline window (add --standalone for pipeline only)
     python pipeline.py status  <session>
 
@@ -95,6 +97,22 @@ def cmd_position(a):
         rig.close()
 
 
+def cmd_checkerboard(a):
+    import stages
+    s = Session(a.session)
+    rig = _rig(s)
+    rig.open(blackfly=True)
+    try:
+        stages.capture_checkerboard(s, rig, stages.ConsoleUI())
+    finally:
+        rig.close()
+
+
+def cmd_guide(a):
+    import stages
+    stages.run_guide_calibration(Session(a.session))
+
+
 def cmd_sparse_export(a):
     import stages
     stages.export_positions(Session(a.session), a.scene, background="none")
@@ -124,6 +142,10 @@ def main(argv=None):
     po = sub.add_parser("position", help="capture one position of a moving object (sparse mask + black)")
     po.add_argument("session"); po.add_argument("scene"); po.add_argument("--mask", help="default: scan mask_00")
     po.set_defaults(f=cmd_position)
+    cb = sub.add_parser("checkerboard", help="white mask: Basler + Blackfly frame of the checkerboard target")
+    cb.add_argument("session"); cb.set_defaults(f=cmd_checkerboard)
+    gd = sub.add_parser("guide", help="run guide_calib.ipynb on the checkerboard -> calibration/guide/guide_to_slm.npz")
+    gd.add_argument("session"); gd.set_defaults(f=cmd_guide)
     se = sub.add_parser("sparse-export", help="sparse cube + RGB for every captured position")
     se.add_argument("session"); se.add_argument("scene"); se.set_defaults(f=cmd_sparse_export)
     cu = sub.add_parser("cube"); cu.add_argument("session"); cu.add_argument("scene")

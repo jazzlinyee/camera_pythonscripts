@@ -109,7 +109,10 @@ When run this way, the camera GUI keeps its remembered mask folders in
 `pipeline/labgui_state/`, so nothing in `camera/` is written. Photos from its own Capture /
 Capture Both / Auto Cycle go into the current session's `sessions/<session>/test_captures/`
 by default (since 2026-11-20); **Choose…** picks another folder, and switching sessions points
-it back to that session's `test_captures/`.
+it back to that session's `test_captures/`. With **"+ black frame"** ticked (default), its manual
+Capture / Capture Both also take each camera again with a fully black mask right after, saved as
+`<photo>_black.<ext>` (e.g. `basler_003.tiff` + `basler_003_black.tiff`); then the previous mask
+(or white) goes back on the SLM. Auto Cycle doesn't take black frames.
 Starting it on its own (`cd ../camera`, then `python gui_test_camera_slm.py`) is unaffected.
 
 `python pipeline.py gui --standalone` opens the pipeline without your camera GUI. It connects to
@@ -125,6 +128,28 @@ python pipeline.py capture 101426 scene1           # at the lab
 python pipeline.py cube    101426 scene1           # ~10-20 min
 python pipeline.py status  101426
 ```
+
+## Blackfly → SLM map (checkerboard + guide calibration)
+
+`export_sparse.py` / **Export positions** warp the Blackfly image onto SLM coordinates with
+`calibration/guide/guide_to_slm.npz`. Row **D/E** on the Calibrate tab makes it:
+
+1. **D. Checkerboard**: choose the laser that lights the target (default: the orientation-check
+   laser; it must be narrowband so the prism doesn't smear the Basler image), set the Basler and
+   Blackfly exposures or press **Auto** (white mask; the "Find the exposure automatically"
+   checkbox also applies), then **Capture checkerboard**. It asks you to put the checkerboard in
+   place and turn that laser on, shows white on the SLM, and saves
+   `calibration/checkerboard/basler_checkerboard.tiff` (x16), `blackfly_checkerboard.png` +
+   `.raw` (raw Bayer) and `checkerboard.json` (exposures, camera settings, saturation). A new
+   capture replaces the old one.
+2. **E. Run guide calibration** runs the lab's `calibration/guide_calib.ipynb` (read-only, its
+   paths swapped in memory) on those two frames and the session's table, with `REF_WAVELENGTH`
+   = that laser's wavelength. Output: `calibration/guide/guide_to_slm.npz` (the previous one is
+   kept as `guide_to_slm_previous.npz`), `guide_in_slm.png` (preview), `guide_calib_ran.ipynb`
+   and `guide.json` (the notebook's report: corners found, homography inliers, reprojection
+   error, coverage). Needs the processing Python, like B. Process.
+
+Command line: `python pipeline.py checkerboard <session>` and `python pipeline.py guide <session>`.
 
 ## Moving object (sparse positions)
 
@@ -237,11 +262,12 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
   (never twice) and the table is un-flipped as before, so it stays in real SLM columns. The
   older calibration-only switch (`flip_patterns_x` in session.json; its Calibrate-tab checkbox
   was removed 2026-11-20) only matters with the flip off.
-- **Auto exposure** (since 2026-11-20). Finds the longest exposure where at most 0.01 % of the
-  pixels are at full scale (4095 Basler, 255 Blackfly; a few hot pixels don't count) - the same
-  measure as the Live window's "saturated … % of pixels". It jumps close, then bisects between
-  "fine" and "too saturated" to within 2 %; usually 5-10 test frames. The allowance is
-  `max_saturated` in session.json (0.0001 = 0.01 %).
+- **Auto exposure** (since 2026-11-20). Finds the longest exposure where at most 0.001 % of the
+  pixels are at full scale (4095 Basler, 255 Blackfly): about 200 of 20 million, so a few hot
+  pixels don't count and the Live window's "saturated … % of pixels" still reads 0.00 %. It
+  jumps close, then bisects between "fine" and "saturated" to within 2 %; usually 5-10 test
+  frames. The allowance is `max_saturated` in session.json as a fraction (0.00001 = 0.001 %,
+  0.000001 = 0.0001 %).
   - **Auto** buttons: on each laser row (tested on that laser's white Gray-code frame, the
     brightest of the set), next to the Capture tab's Basler exposure (tests 8 of the 56 scan
     masks spread evenly and keeps the brightest under the limit; also the Blackfly when
@@ -255,7 +281,7 @@ SLM, prism and camera). Every stage, the GUI and the checks work the same way. S
     the SLM (runs in the background; live views pause meanwhile).
   - Records: `exposure_source` ("auto"/"manual") and `auto_exposure` (every test frame) in
     manifest.json / position.json / capture.json, plus `blackfly_exposure_us`.
-  - Limits in session.json `"auto_exposure"`: `max_saturated` (0.0001), `min_us` (20), `max_us`
+  - Limits in session.json `"auto_exposure"`: `max_saturated` (0.00001), `min_us` (20), `max_us`
     (2 s), `blackfly_max_us` (1 s), `scene_test_masks` (8).
 - **No image offset.** Every time the Basler or Blackfly opens, it is set to the full sensor:
   OffsetX/OffsetY 0, binning 1x1, maximum width/height (Basler 5472 x 3648, Blackfly 1440 x 1080;

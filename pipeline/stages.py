@@ -203,7 +203,7 @@ def auto_search(rig, ui, log, spec, start_us=None):
     ae, mod = spec["ae"], spec["mod"]
     stopped = getattr(ui, "stopped", lambda: False)
     label = f" ({spec['label']})" if spec.get("label") else ""
-    log(f"Finding the Basler exposure{label}: longest with at most {ae['max_saturated']:.2%} of pixels "
+    log(f"Finding the Basler exposure{label}: longest with at most {ae['max_saturated']:.4%} of pixels "
         f"saturated, testing {len(spec['indices'])} mask(s)...")
 
     def grab_basler(us):
@@ -251,7 +251,12 @@ def find_exposure(session, rig, ui, log=print, kind="scene", laser=None, mask_pa
     'scene' (several scan masks) or 'position' (the sparse mask). Returns auto_search's dict."""
     s = session.settings
     bf = (s["blackfly"]["enabled"] if use_blackfly is None else use_blackfly) and kind != "laser"
-    if kind == "laser":
+    if kind == "checkerboard":
+        folder, nm = checkerboard_laser(session)
+        masks = [np.full((1080, 1920), 255, np.uint8)]
+        spec = auto_spec(session, [0], [0], keep=True, label=f"checkerboard, white mask, {folder} laser")
+        start = s["checkerboard"]["basler_exposure_us"]
+    elif kind == "laser":
         lasers = [l for l in s["calibration"]["lasers"] if l[0] == laser]
         if not lasers:
             raise StageError(f"No laser called {laser!r} in session.json.")
@@ -278,11 +283,12 @@ def find_exposure(session, rig, ui, log=print, kind="scene", laser=None, mask_pa
     if hasattr(rig, "begin"):
         ui.main(rig.begin)
     try:
-        if kind == "laser":
+        if kind in ("laser", "checkerboard"):
             if hasattr(rig, "set_light"):
                 rig.set_light(folder)
             else:
-                msg = f"Turn ON the {nm} nm laser ({folder}) and make sure the other lasers are OFF."
+                msg = (("Put the checkerboard target in place. " if kind == "checkerboard" else "")
+                       + f"Turn ON the {nm:g} nm laser ({folder}) and make sure the other lasers are OFF.")
                 log(f"  >> {msg}  (waiting for OK)")
                 if not ui.prompt(msg):
                     raise StageError("Cancelled.")
@@ -291,6 +297,12 @@ def find_exposure(session, rig, ui, log=print, kind="scene", laser=None, mask_pa
         if hasattr(rig, "end"):
             ui.main(rig.end)
     session.reload()
+    if kind == "checkerboard":
+        session.settings["checkerboard"]["basler_exposure_us"] = res["basler"]["exposure_us"]
+        if res.get("blackfly"):
+            session.settings["checkerboard"]["blackfly_exposure_us"] = res["blackfly"]["exposure_us"]
+        session.save()
+        return res
     if kind == "laser":
         for l in session.settings["calibration"]["lasers"]:
             if l[0] == laser:
@@ -631,6 +643,143 @@ def calibrate_check(session, log=print):
     res["checked"] = _now()
     (cal / "check.json").write_text(json.dumps(res, indent=2))
     return res
+
+
+# =============================================================== CHECKERBOARD + GUIDE CALIBRATION (2026-11-20)
+def checkerboard_dir(session):
+    return session.dir / "calibration" / "checkerboard"
+
+
+def checkerboard_laser(session):
+    """(folder, nm) of the laser that lights the checkerboard (default: the check laser)."""
+    s = session.settings
+    folder = s["checkerboard"].get("laser") or s["calibration"]["check_laser"]
+    nm = next((l[1] for l in s["calibration"]["lasers"] if l[0] == folder), None)
+    if nm is None:
+        raise StageError(f"No laser called {folder!r} in session.json for the checkerboard.")
+    return folder, float(nm)
+
+
+def capture_checkerboard(session, rig, ui, log=print, auto=None):
+    """The checkerboard frames guide_calib.ipynb needs: white on the SLM, the target lit by
+    one laser (narrowband, so the prism doesn't smear the Basler image), one Basler frame
+    (x16 TIFF) and one Blackfly frame (raw Bayer .png + .raw). -> calibration/checkerboard/,
+    replacing an earlier checkerboard capture."""
+    s = session.settings
+    cb = s["checkerboard"]
+    folder, nm = checkerboard_laser(session)
+    if getattr(rig, "blackfly", True) is None:
+        raise StageError("The Blackfly is not open - open it (top bar) for the checkerboard capture.")
+    d = checkerboard_dir(session)
+    d.mkdir(parents=True, exist_ok=True)
+    for name in ("basler_checkerboard.tiff", "blackfly_checkerboard.png", "blackfly_checkerboard.raw",
+                 "checkerboard.json"):
+        (d / name).unlink(missing_ok=True)
+    ui.main(lambda: rig.load_masks([np.full((1080, 1920), 255, np.uint8)]))
+    use_auto = _want_auto(session, auto)
+    if not use_auto and hasattr(rig, "set_blackfly_exposure"):
+        rig.set_blackfly_exposure(cb["blackfly_exposure_us"])
+    shot = dict(mask_index=0, fmt="raw16", group="checkerboard", light=folder, exposure=cb["basler_exposure_us"],
+                prompt=(f"Put the checkerboard target in place. Turn ON the {nm:g} nm laser ({folder}) to light it "
+                        f"and make sure the other lasers are OFF."),
+                save={"basler": d / "basler_checkerboard.tiff", "blackfly": d / "blackfly_checkerboard.png"})
+    if use_auto:
+        shot["auto"] = auto_spec(session, [0], [0], keep=True, label=f"checkerboard, white mask, {folder} laser")
+    bf_settings = None
+    if getattr(rig, "blackfly", None) is not None and hasattr(rig.blackfly, "raw_settings"):
+        try:
+            bf_settings = json.loads(json.dumps(rig.blackfly.raw_settings(), default=str))
+        except Exception as e:  # noqa
+            bf_settings = {"error": str(e)}
+    log(f"Checkerboard capture: white on the SLM, {folder} laser ({nm:g} nm), Basler + Blackfly"
+        + (", exposures found automatically first." if use_auto else
+           f", Basler {cb['basler_exposure_us']:.0f} us, Blackfly {cb['blackfly_exposure_us']:.0f} us."))
+    run_shots(rig, [shot], ui, log)
+    src, auto_res = _auto_record([shot], "checkerboard")
+    bf_path = d / "blackfly_checkerboard.png"
+    bf_img = cv2.imread(str(bf_path), cv2.IMREAD_UNCHANGED) if bf_path.is_file() else None
+    rec = {"captured": _now(), "session": session.name, "laser": folder, "nm": nm,
+           "basler_exposure_us": shot["exposure"],
+           "blackfly_exposure_us": getattr(rig, "blackfly_exposure_us", None),
+           "exposure_source": src, "auto_exposure": auto_res, "pixel_scale": PIXEL_SCALE,
+           "basler_bright_fraction": round(shot["bright"], 3), "basler_saturated": shot["saturated"],
+           "blackfly_saturated": float(np.mean(bf_img >= 255)) if bf_img is not None else None,
+           "basler_settings": shot.get("basler_settings"), "blackfly_settings": bf_settings,
+           "files": {"basler": "basler_checkerboard.tiff", "blackfly": "blackfly_checkerboard.png",
+                     "blackfly_raw": "blackfly_checkerboard.raw"}}
+    (d / "checkerboard.json").write_text(json.dumps(rec, indent=2))
+    session.reload()
+    session.settings["checkerboard"]["basler_exposure_us"] = shot["exposure"]
+    if rec["blackfly_exposure_us"]:
+        session.settings["checkerboard"]["blackfly_exposure_us"] = rec["blackfly_exposure_us"]
+    session.save()
+    if bf_img is None:
+        log("WARNING: no Blackfly frame was saved - is the Blackfly open?")
+    if shot["saturated"] > 0.001:
+        log(f"WARNING: {shot['saturated']:.1%} of the Basler frame is saturated - lower its exposure.")
+    if rec["blackfly_saturated"] and rec["blackfly_saturated"] > 0.001:
+        log(f"WARNING: {rec['blackfly_saturated']:.1%} of the Blackfly frame is saturated - lower its exposure.")
+    log(f"Checkerboard saved in {d}. Next: E. Run guide calibration.")
+    return rec
+
+
+def run_guide_calibration(session, log=print):
+    """Run the lab's guide_calib.ipynb (read-only, paths swapped in memory) on the
+    checkerboard capture and the session's table -> calibration/guide/guide_to_slm.npz (the
+    previous one is kept as guide_to_slm_previous.npz) + guide_in_slm.png preview."""
+    d = checkerboard_dir(session)
+    need = [d / "basler_checkerboard.tiff", d / "blackfly_checkerboard.png", d / "blackfly_checkerboard.raw"]
+    missing = [p.name for p in need if not p.is_file()]
+    if missing:
+        raise StageError(f"No checkerboard capture yet ({', '.join(missing)} missing) - press Capture checkerboard.")
+    if not session.table.is_file():
+        raise StageError(f"No table at {session.table} - run B. Process first.")
+    rec = json.loads((d / "checkerboard.json").read_text()) if (d / "checkerboard.json").is_file() else {}
+    nm = float(rec.get("nm") or checkerboard_laser(session)[1])
+    nb = session.lab_path("calibration_code") / "guide_calib.ipynb"
+    if not nb.is_file():
+        raise StageError(f"guide_calib.ipynb not found at {nb}.")
+    gdir = session.cal_dir / "guide"
+    gdir.mkdir(parents=True, exist_ok=True)
+    out = gdir / "guide_to_slm.npz"
+    if out.is_file():
+        shutil.copy2(out, gdir / "guide_to_slm_previous.npz")
+    rules = [Rule("checkerboard, guide camera (Blackfly)", r".*rgb\.png", str(d / "blackfly_checkerboard.png"), 2),
+             Rule("checkerboard, Basler", r".*monochrome\.png", str(d / "basler_checkerboard.tiff"), 1),
+             Rule("table", r".*reverse_lookup.*\.npz", str(session.table), 1),
+             Rule("raw guide image", r".*img_rgb\.raw", str(d / "blackfly_checkerboard.raw"), 1),
+             Rule("output map", r"guide_to_slm.*\.npz", str(out), 1),
+             Rule("output preview", r"guide_in_slm.*\.png", str(gdir / "guide_in_slm.png"), 1)]
+    code_rules = [CodeRule("illumination wavelength", "REF_WAVELENGTH   = 532.0", f"REF_WAVELENGTH   = {nm}", 1),
+                  CodeRule("save the preview", "# cv2.imwrite(OUT_PREVIEW, guide_in_slm)",
+                           "cv2.imwrite(OUT_PREVIEW, guide_in_slm)", 1)]
+    work = gdir / "work"
+    work.mkdir(exist_ok=True)
+    t0 = time.time()
+    log(f"Guide calibration: guide_calib.ipynb on the checkerboard ({rec.get('laser', '?')} laser, {nm:g} nm) "
+        f"and table {session.table.name}...")
+    before = out.stat().st_mtime if out.is_file() else None
+    if not run_notebook(nb, rules, work, gdir / "guide_calib_ran.ipynb", log, code_rules=code_rules):
+        raise StageError("guide_calib.ipynb failed (see above). The previous guide_to_slm.npz is unchanged.")
+    if not out.is_file() or (before is not None and out.stat().st_mtime == before):
+        raise StageError("guide_calib.ipynb ran but did not write guide_to_slm.npz.")
+    summary = []
+    try:                                   # the notebook's own report lines
+        ran = json.loads((gdir / "guide_calib_ran.ipynb").read_text())
+        for c in ran["cells"]:
+            for o in c.get("outputs", []):
+                for ln in "".join(o.get("text", "")).splitlines():
+                    if any(k in ln for k in ("corner", "inliers", "reprojection", "coverage", "WARNING", "reference band")):
+                        summary.append(ln.strip())
+    except Exception:  # noqa
+        pass
+    for ln in summary:
+        log("  " + ln)
+    (gdir / "guide.json").write_text(json.dumps({"made": _now(), "checkerboard": str(d), "nm": nm,
+                                                 "table": str(session.table), "report": summary,
+                                                 "seconds": round(time.time() - t0)}, indent=2))
+    log(f"Guide calibration done -> {out} (preview: guide_in_slm.png). Export positions uses it.")
+    return summary
 
 
 # =============================================================== CAPTURE

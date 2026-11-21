@@ -129,8 +129,8 @@ SLM_OPENS_WHITE = True
 # orientation; their "flipped_x" says whether the SLM showed them flipped.
 SLM_FLIP_X = True
 
-# "Auto Exposure" button (added 2026-11-20): the longest exposure with at most 0.01 % of the
-# pixels at full scale (the Live window's "saturated % of pixels"), for whatever is on the SLM.
+# "Auto Exposure" button (added 2026-11-20): the longest exposure with at most 0.001 % of the
+# pixels at full scale (the Live window still reads 0.00 %), for whatever is on the SLM.
 # See auto_exposure.py. Limits per camera, in microseconds.
 AUTO_EXPOSURE_MIN_US = 20
 AUTO_EXPOSURE_MAX_US = {"basler": 2_000_000, "blackfly": 1_000_000}
@@ -316,14 +316,14 @@ class App:
         self.choose_save_dir_btn.grid(row=6, column=2, sticky="w")
 
         self.capture_btn = ttk.Button(
-            cam_frame, text="Capture", command=self.capture, state="disabled"
+            cam_frame, text="Capture", command=self._manual_capture, state="disabled"
         )
         self.capture_btn.grid(row=7, column=0, columnspan=3, pady=(10, 0))
 
         self.capture_both_btn = ttk.Button(
             cam_frame,
             text="Capture Both",
-            command=self.capture_both,
+            command=self._manual_capture_both,
             state="disabled",
         )
         self.capture_both_btn.grid(row=8, column=0, columnspan=3, pady=(0, 4))
@@ -331,7 +331,12 @@ class App:
             cam_frame,
             text="(back-to-back, not hardware-synced)",
             foreground="gray40",
-        ).grid(row=9, column=0, columnspan=3, pady=(0, 10))
+        ).grid(row=9, column=0, columnspan=3, pady=(0, 2))
+        # manual Capture / Capture Both also take a frame with a fully black mask (2026-11-20)
+        self.black_frame_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            cam_frame, text="+ black frame (same camera(s), black mask)", variable=self.black_frame_var,
+        ).grid(row=10, column=0, columnspan=3, pady=(0, 10))
 
         slm_wrap = ttk.Frame(self.top_section)
         slm_wrap.grid(row=0, column=1, sticky="nsew", **pad)
@@ -824,7 +829,7 @@ class App:
             start = float(cam.get_exposure_time())
         except (CameraError, TypeError, ValueError):
             start = 10000.0
-        self.log(f"Auto exposure ({choice}): longest exposure with at most 0.01% of pixels at {full}...")
+        self.log(f"Auto exposure ({choice}): longest exposure with at most 0.001% of pixels at {full}...")
 
         def grab(us):
             # a frame that started exposing before the change is thrown away (exposure-aware)
@@ -1059,6 +1064,9 @@ class App:
         the SLM is closed or what it shows isn't known."""
         if self.slm is None:
             return None
+        if getattr(self, "_showing_black", False):
+            return ("black", np.zeros((HEIGHT, WIDTH), dtype=np.uint8),
+                    {"source": "black (for the black frame)", "flipped_x": bool(self.slm_flip_var.get())})
         if getattr(self, "_showing_white", False):
             return ("white", np.full((HEIGHT, WIDTH), 255, dtype=np.uint8),
                     {"source": "white (SLM default)", "flipped_x": bool(self.slm_flip_var.get())})
@@ -1123,7 +1131,60 @@ class App:
             self.log(f"(could not record Basler settings: {e})")
 
     def capture(self, extra=""):
-        self._capture_one(self.cam_choice.get(), extra=extra)
+        return self._capture_one(self.cam_choice.get(), extra=extra)
+
+    def _manual_capture(self):
+        """The Capture button: the photo, then (if '+ black frame' is ticked) the same camera
+        with a black mask."""
+        choice = self.cam_choice.get()
+        saved = self.capture()
+        if saved and self.black_frame_var.get():
+            self._capture_black_frames([(choice, Path(saved))])
+
+    def _manual_capture_both(self):
+        if not all(c is not None for c in self.cams.values()):
+            self.log("Capture Both needs both cameras open.")
+            return
+        self.log("Capturing both cameras back-to-back (not hardware-synced).")
+        shots = [(c, self._capture_one(c, suffix_camera=True)) for c in ("blackfly", "basler")]
+        shots = [(c, Path(p)) for c, p in shots if p]
+        if shots and self.black_frame_var.get():
+            self._capture_black_frames(shots)
+
+    def _capture_black_frames(self, shots):
+        """After a manual capture: show a fully black mask, throw away one frame per camera
+        (so the image really changed), take each camera again at the same exposure as
+        <photo>_black.<ext>, then put the previous mask (or white) back (added 2026-11-20)."""
+        if self.slm is None:
+            self.log("The SLM is closed - no black frame taken.")
+            return
+        prev_index = self._current_mask_index
+        prev_white = getattr(self, "_showing_white", False)
+        black = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+        try:
+            self.slm.set_masks(list(self.masks) + [black])
+            self.slm.show_mask(len(self.masks))
+        except SLMError as e:
+            self.log(f"Could not show the black mask: {e} - no black frame taken.")
+            return
+        self._showing_black, self._showing_white, self._current_mask_index = True, False, None
+        self._mask_thumb_photo = array_to_photoimage(black, *self.preview_sizes["mask"])
+        self.mask_preview_label.configure(image=self._mask_thumb_photo)
+        try:
+            for choice, _ in shots:
+                self._flush_stale_frame(choice)
+            for choice, saved in shots:
+                self._capture_one(choice, path=saved.with_name(f"{saved.stem}_black{saved.suffix}"))
+        finally:
+            self._showing_black = False
+            try:
+                if prev_index is not None and prev_index < len(self.masks):
+                    self.slm.set_masks(self.masks)
+                    self.show_mask(prev_index)        # also flushes a stale frame + updates the preview
+                else:
+                    self.show_white()
+            except SLMError as e:
+                self.log(f"Could not put the previous mask back: {e}")
 
     def capture_both(self, extra=""):
         """Capture from both cameras, one right after the other. This is
@@ -1140,15 +1201,17 @@ class App:
         self._capture_one("blackfly", suffix_camera=True, extra=extra)
         self._capture_one("basler", suffix_camera=True, extra=extra)
 
-    def _capture_one(self, choice: str, suffix_camera: bool = False, extra: str = ""):
+    def _capture_one(self, choice: str, suffix_camera: bool = False, extra: str = "", path=None):
         cam = self.cams[choice]
         if cam is None:
             return None
         if getattr(self, "_auto_exp_busy", False):
             self.log("Wait for Auto Exposure to finish before capturing.")
             return None
+        numbered = path is None
         try:
-            path = self._next_capture_path(choice, suffix_camera=suffix_camera, extra=extra)
+            if numbered:
+                path = self._next_capture_path(choice, suffix_camera=suffix_camera, extra=extra)
         except OSError as e:
             self.log(f"Can't use the save folder '{self.save_dir}': {e}")
             return None
@@ -1159,7 +1222,8 @@ class App:
             self.log(f"Capture failed ({choice}): {e}")
             return None
 
-        self.shots[choice] += 1
+        if numbered:
+            self.shots[choice] += 1
         self.log(f"Saved {saved}")
         if choice == "blackfly":
             self._record_blackfly_settings(cam, Path(saved))
@@ -1297,6 +1361,7 @@ class App:
         self.log("Showing white (SLM default).")
         self._current_mask_index = None
         self._showing_white = True
+        self._showing_black = False
         self._mask_thumb_photo = array_to_photoimage(white, *self.preview_sizes["mask"])
         self.mask_preview_label.configure(image=self._mask_thumb_photo)
 
@@ -1340,6 +1405,7 @@ class App:
         self.log(f"Showing mask {index} ({name}).")
         self._current_mask_index = index
         self._showing_white = False
+        self._showing_black = False
         self._mask_thumb_photo = array_to_photoimage(
             self._as_shown(self.masks[index]), *self.preview_sizes["mask"]
         )

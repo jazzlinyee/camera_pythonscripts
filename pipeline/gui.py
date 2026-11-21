@@ -632,8 +632,10 @@ class App:
                                     "(longest without saturation, on each laser's white frame)",
                         variable=self.auto_var).pack(side="left")
 
-        btns = ttk.Frame(f)
-        btns.grid(row=4, column=0, sticky="we", pady=10)
+        btnwrap = ttk.Frame(f)
+        btnwrap.grid(row=4, column=0, sticky="we", pady=10)
+        btns = ttk.Frame(btnwrap)
+        btns.pack(fill="x")
         ttk.Button(btns, text="B. Process → table",
                    command=lambda: self.run_proc(["calibrate", "process", "{S}"], what="Calibrate process",
                                                  dest="cal")).pack(side="left")
@@ -642,6 +644,26 @@ class App:
                                                  dest="cal")).pack(side="left", padx=6)
         self.cal_summary = ttk.Label(btns, text="", foreground=self.C["text2"])
         self.cal_summary.pack(side="left", padx=12)
+        # D/E: checkerboard capture + guide calibration (Blackfly -> SLM map), 2026-11-20
+        cbf = ttk.Frame(btnwrap)
+        cbf.pack(fill="x", pady=(8, 0))
+        ttk.Label(cbf, text="D. Checkerboard (for the Blackfly → SLM map):").pack(side="left")
+        ttk.Label(cbf, text="laser").pack(side="left", padx=(8, 2))
+        self.cb_laser_var = tk.StringVar()
+        self.cb_laser_box = ttk.Combobox(cbf, textvariable=self.cb_laser_var, width=7, state="readonly")
+        self.cb_laser_box.pack(side="left")
+        ttk.Label(cbf, text="Basler µs").pack(side="left", padx=(8, 2))
+        self.cb_bexp = tk.StringVar()
+        ttk.Entry(cbf, textvariable=self.cb_bexp, width=9).pack(side="left")
+        ttk.Label(cbf, text="Blackfly µs").pack(side="left", padx=(8, 2))
+        self.cb_fexp = tk.StringVar()
+        ttk.Entry(cbf, textvariable=self.cb_fexp, width=9).pack(side="left")
+        ttk.Button(cbf, text="Auto", command=lambda: self.run_auto("checkerboard")).pack(side="left", padx=(6, 0))
+        ttk.Button(cbf, text="Capture checkerboard", command=self.run_checkerboard).pack(side="left", padx=6)
+        ttk.Button(cbf, text="E. Run guide calibration",
+                   command=lambda: self.run_proc(["guide", "{S}"], what="Guide calibration", dest="cal")).pack(side="left")
+        self.cb_status = ttk.Label(cbf, text="", foreground=self.C["text2"])
+        self.cb_status.pack(side="left", padx=10)
 
         # terminal-style output panel for calibration capture + processing
         term = ttk.Frame(f)
@@ -693,6 +715,7 @@ class App:
             self._laser_names[folder] = name
         names = [r[0] for r in self.laser_rows]
         self.check_box.configure(values=names)
+        self.cb_laser_box.configure(values=names)
         cl = self.session.settings["calibration"].get("check_laser")
         self.check_var.set(cl if cl in names else (names[0] if names else ""))
 
@@ -1158,6 +1181,10 @@ class App:
         self.settle_var.set(str(s["settle_ms"]))
         self.flip_var.set(bool(s["calibration"].get("flip_patterns_x", False)))
         self.auto_var.set(bool(s.get("auto_exposure", {}).get("before_capture", False)))
+        cb = s.get("checkerboard", {})
+        self.cb_laser_var.set(cb.get("laser") or s["calibration"].get("check_laser", ""))
+        self.cb_bexp.set(f"{cb.get('basler_exposure_us', 10000):.0f}")
+        self.cb_fexp.set(f"{cb.get('blackfly_exposure_us', 20000):.0f}")
         if hasattr(self, "slm_flip_var"):               # the session's SLM flip -> top bar + camera GUI
             on = bool(s["slm"].get("flip_x", True))
             self.slm_flip_var.set(on)
@@ -1210,6 +1237,10 @@ class App:
             s["blackfly"]["enabled"] = bool(self.bf_var.get())
             s["slm"]["flip_x"] = True        # masks are always flipped (no checkbox since 2026-11-20)
             s.setdefault("auto_exposure", {})["before_capture"] = bool(self.auto_var.get())
+            cb = s.setdefault("checkerboard", {})
+            cb["laser"] = self.cb_laser_var.get()
+            cb["basler_exposure_us"] = float(self.cb_bexp.get())
+            cb["blackfly_exposure_us"] = float(self.cb_fexp.get())
         except ValueError:
             messagebox.showerror("Settings", "Wavelengths, exposures and settle time must be numbers."); return False
         self.session.save()
@@ -1266,6 +1297,24 @@ class App:
                 txt += f" (left-right {r['shift_x']['predicted_px']:+} predicted vs {r['shift_x']['measured_px']:+} px)"
             parts.append(txt)
         self.cal_summary.configure(text="   ·   ".join(parts))
+        cbj = s.dir / "calibration" / "checkerboard" / "checkerboard.json"
+        gj = s.cal_dir / "guide" / "guide.json"
+        cbt = []
+        try:
+            if cbj.is_file():
+                c = json.loads(cbj.read_text())
+                cbt.append(f"captured {c['captured'][5:16].replace('T', ' ')} ({c.get('laser')})"
+                           + (", SATURATED" if max(c.get("basler_saturated") or 0, c.get("blackfly_saturated") or 0) > 0.001 else ""))
+            else:
+                cbt.append("not captured")
+            if gj.is_file():
+                g = json.loads(gj.read_text())
+                cbt.append(f"guide map made {g['made'][5:16].replace('T', ' ')}")
+            elif (s.cal_dir / "guide" / "guide_to_slm.npz").is_file():
+                cbt.append("guide map: yes (copied)")
+        except Exception:  # noqa
+            pass
+        self.cb_status.configure(text=" · ".join(cbt))
         if hasattr(self, "pos_info"):
             self._pos_refresh()
         self.scene_list.delete(0, "end")
@@ -1429,6 +1478,10 @@ class App:
             if e is not None:
                 exp_var.set(f"{e:.0f}")
         self.cap_exp.set(f"{s['capture']['exposure_us']:.0f}")
+        cb = s.get("checkerboard", {})
+        if cb:
+            self.cb_bexp.set(f"{cb['basler_exposure_us']:.0f}")
+            self.cb_fexp.set(f"{cb['blackfly_exposure_us']:.0f}")
 
     def run_auto(self, kind, laser=None):
         """The Auto buttons: find the longest unsaturated exposure, set it on the camera(s)
@@ -1438,8 +1491,8 @@ class App:
         if not self.session or not self.save_form() or not self._need_rig():
             return
         what = {"laser": f"Auto exposure ({laser})", "scene": "Auto exposure (full scan)",
-                "position": "Auto exposure (moving object)"}[kind]
-        if not self._start(what, dest="cal" if kind == "laser" else "main"):
+                "position": "Auto exposure (moving object)", "checkerboard": "Auto exposure (checkerboard)"}[kind]
+        if not self._start(what, dest="cal" if kind in ("laser", "checkerboard") else "main"):
             return
         self._refresh_exp_after = True
         self.live_on = False
@@ -1466,6 +1519,25 @@ class App:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             self.log("Stopping…", "warn")
+
+    def run_checkerboard(self):
+        """D. Capture checkerboard: white on the SLM, one Basler + one Blackfly frame."""
+        if not self.session or not self.save_form() or not self._need_rig():
+            return
+        if not self._start("Capture checkerboard", dest="cal"):
+            return
+        self._refresh_exp_after = True
+        self.live_on = False
+        self.rig.settle_s = self.session.settings["settle_ms"] / 1000
+
+        def work():
+            import stages
+            try:
+                stages.capture_checkerboard(self.session, self.rig, self.ui, log=self.log)
+                self.q.put(("done", True, "Checkerboard captured. Next: E. Run guide calibration."))
+            except Exception as e:  # noqa
+                self.q.put(("done", False, f"ERROR: {e}"))
+        threading.Thread(target=work, daemon=True).start()
 
     def run_cal_capture(self, folder):
         if not self.session or not self.save_form() or not self._need_rig():

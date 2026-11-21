@@ -7,8 +7,9 @@ that takes an exposure, sets it on the camera and returns a fresh frame (or a li
 frames, e.g. one per mask); it never talks to a camera itself.
 
 "Oversaturated" = more than `max_saturated` of all pixels at full scale (4095 for the 12-bit
-Basler, 255 for the 8-bit Blackfly). Default 0.01 % (Rika, 2026-11-20), so a few hot pixels
-don't count: the same measure as the Live window's "saturated ... % of pixels" readout.
+Basler, 255 for the 8-bit Blackfly). Default 0.001 % (Rika, 2026-11-20): about 200 of the
+Basler's 20 million pixels, enough to ignore a few hot pixels, while the Live window's
+"saturated ... % of pixels" still reads 0.00 %.
 
 Goal (changed 2026-11-20 at Rika's request): the exposure just before parts turn red, not
 a safety margin below it. How it searches (usually 5-9 frames):
@@ -26,7 +27,7 @@ import math
 
 import numpy as np
 
-DEFAULT_MAX_SATURATED = 1e-4      # allowed fraction of pixels at full scale (0.01 %)
+DEFAULT_MAX_SATURATED = 1e-5      # allowed fraction of pixels at full scale (0.001 %)
 EDGE_GAP = 0.02                   # stop when "fine" and "saturated" are less than 2 % apart
 AIM = 0.99                        # where the jump in step 3 aims (fraction of full scale)
 
@@ -34,7 +35,7 @@ AIM = 0.99                        # where the jump in step 3 aims (fraction of f
 def measure(frame, full_scale, max_saturated=DEFAULT_MAX_SATURATED, bayer=False):
     """(saturated fraction, brightness) of one frame. saturated fraction = pixels at full
     scale / all pixels. Brightness = the level that only `max_saturated` of the pixels
-    exceed (with 0.01 %: the 99.99th percentile), as a fraction of full scale. `bayer` is accepted for compatibility and not needed."""
+    exceed (with 0.001 %: the 99.999th percentile), as a fraction of full scale. `bayer` is accepted for compatibility and not needed."""
     a = np.asarray(frame)
     sat = float(np.count_nonzero(a >= full_scale)) / a.size
     sub = a[::2, ::2].ravel() if a.ndim == 2 and a.size > 4_000_000 else a.ravel()

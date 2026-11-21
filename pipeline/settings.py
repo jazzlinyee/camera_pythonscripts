@@ -46,10 +46,13 @@ DEFAULTS = {
     # follows the "Flip masks" checkbox (top bar / camera GUI's SLM panel).
     "slm": {"monitor_index": None, "mirrored": False, "flip_x": True},
     # Automatic exposure (2026-11-20): the longest exposure with at most max_saturated of the
-    # pixels at full scale (0.01 %, like the Live window's "saturated % of pixels"). before_capture = the "Find
+    # pixels at full scale (0.00001 = 0.001 %; the Live window still reads 0.00 %). before_capture = the "Find
     # exposure before capturing" checkbox. scene_test_masks = how many of the 56 scan masks
     # are tested for a full scan (spread evenly; the brightest decides).
-    "auto_exposure": {"before_capture": False, "max_saturated": 0.0001,
+    # Checkerboard capture for guide_calib.ipynb (2026-11-20): lit by one laser ("" = the
+    # orientation-check laser), white on the SLM, one Basler + one Blackfly frame.
+    "checkerboard": {"laser": "", "basler_exposure_us": 10000, "blackfly_exposure_us": 20000},
+    "auto_exposure": {"before_capture": False, "max_saturated": 0.00001,
                       "min_us": 20, "max_us": 2000000, "blackfly_max_us": 1000000,
                       "scene_test_masks": 8},
     "basler": {"serial": None, "gain_db": 0.0},
@@ -118,7 +121,7 @@ class Session:
             if self.settings["lab"].get(k) in old:
                 self.settings["lab"][k] = DEFAULTS["lab"][k]
         ae = self.settings.get("auto_exposure", {})
-        if ae.get("max_saturated") == 0.001:           # 0.1 % was the default for an hour on 11-20
+        if ae.get("max_saturated") in (0.001, 0.0001, 0.0):  # earlier defaults (11-20), saved into session.json
             ae["max_saturated"] = DEFAULTS["auto_exposure"]["max_saturated"]
 
     def reload(self):
